@@ -33,6 +33,7 @@ extern "C" {
 #define PROP_MAC_ADDR L"PermanentAddress"
 #define PROP_PROCESS L"ProcessID"
 #define PROP_BIOS_GUID L"BIOSGUID"
+#define PROP_INSTANCE_ID L"InstanceID"
 
 /**
  * Functions to parse the XML in the GuestIntrinsicExchangeItems 
@@ -1027,7 +1028,7 @@ void readVms(HSP *sp)
 								BOOL noUUID = true;
 								wchar_t *biosGuidString = NULL;
 								while (vssdObj && noUUID) {
-									biosGuidString = stringFromWMIProperty(vssdObj, PROP_BIOS_GUID);
+									biosGuidString = stringFromWMIProperty(vssdObj, PROP_INSTANCE_ID);
 									noUUID = false;
 								}
 								if (vssdObj != NULL) {
@@ -1035,7 +1036,8 @@ void readVms(HSP *sp)
 								}
 								if (biosGuidString != NULL) { 
 									char uuid[16];
-									wchexToBinary(biosGuidString, (UCHAR *)uuid, 33);
+									// Strip the Microsoft: from the guid
+									wchexToBinary(biosGuidString + 10, (UCHAR *)uuid, 33);
 									my_free(biosGuidString);
 									wchar_t *friendlyName = stringFromWMIProperty(vmObj, PROP_ELEMENT_NAME);
 									VARIANT processVal;
