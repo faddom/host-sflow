@@ -630,10 +630,13 @@ static SFLAdaptorList *getVmAdaptors(HSP *sp, HVSVmState *state, SFLAdaptorList 
 	if (sp->vAdaptorList != NULL) {
 		for (uint32_t i = 0; i < sp->vAdaptorList->num_adaptors; i++) {
 			SFLAdaptor *adaptor = sp->vAdaptorList->adaptors[i];
-			wchar_t *adVmName = ((HVSVPortInfo *)adaptor->userData)->vmSystemName;
-			if (adVmName != NULL && StrCmpIW(vmName, adVmName) == 0 &&
-				vmAdaptors->num_adaptors < vmAdaptors->capacity) {
-				vmAdaptors->adaptors[vmAdaptors->num_adaptors++] = adaptor;
+			if (((HVSVPortInfo *)adaptor->userData)->filterEnabled)
+			{
+				wchar_t *adVmName = ((HVSVPortInfo *)adaptor->userData)->vmSystemName;
+				if (adVmName != NULL && StrCmpIW(vmName, adVmName) == 0 &&
+					vmAdaptors->num_adaptors < vmAdaptors->capacity) {
+					vmAdaptors->adaptors[vmAdaptors->num_adaptors++] = adaptor;
+				}
 			}
 		}
 	}
@@ -702,6 +705,11 @@ void getCounters_vm(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs
 	vmAdaptors.num_adaptors = 0;
 	adaptorsElem.counterBlock.adaptors = getVmAdaptors(sp, state, &vmAdaptors);
 	SFLADD_ELEMENT(cs, &adaptorsElem);
+
+	// VNT flag counter
+	SFLCounters_sample_element vntFlagElem = { 0 };
+	vntFlagElem.tag = SFLCOUNTERS_VNT_HYPERV;
+	SFLADD_ELEMENT(cs, &vntFlagElem);
 
 	sfl_poller_writeCountersSample(poller, cs);
 }

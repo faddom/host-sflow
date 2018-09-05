@@ -1,5 +1,5 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="..\version.targets" />
   <Import Project="driverVersion.targets" />
   <ItemGroup Label="ProjectConfigurations">
@@ -20,9 +20,7 @@
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
-  <PropertyGroup Label="Globals">
-    <VCTargetsPath Condition="'$(VCTargetsPath11)' != '' and '$(VSVersion)' == '' and '$(VisualStudioVersion)' == ''">$(VCTargetsPath11)</VCTargetsPath>
-  </PropertyGroup>
+  <PropertyGroup Label="Globals" />
   <PropertyGroup Label="Globals">
     <ProjectGuid>{9E50D21F-CB47-4871-AF2C-1D557A7DC075}</ProjectGuid>
     <RootNamespace>installer</RootNamespace>
@@ -31,26 +29,26 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='win-debug|Win32'" Label="Configuration">
     <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v110</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='win-debug|x64'" Label="Configuration">
     <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v110</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='win|Win32'" Label="Configuration">
     <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v110</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='win|x64'" Label="Configuration">
     <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v110</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -241,14 +239,14 @@
   <ItemGroup>
     <CustomBuild Include="installer.wxs">
       <FileType>Document</FileType>
-      <Command Condition="'$(Configuration)|$(Platform)'=='win-debug|x64'">"$(ProgramFiles)\Windows Installer XML v3.5\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -dextension -ddriverSourceDir="$(SolutionDir)switch-extension" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -ddriverVersion="$(DriverVersion)" -o $(IntDir) "%(Identity)"
-"$(ProgramFiles)\Windows Installer XML v3.5\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
-      <Command Condition="'$(Configuration)|$(Platform)'=='win-debug|Win32'">"$(ProgramFiles)\Windows Installer XML v3.5\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -o $(IntDir) "%(Identity)"
-"$(ProgramFiles)\Windows Installer XML v3.5\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
-      <Command Condition="'$(Configuration)|$(Platform)'=='win|Win32'">"$(ProgramFiles)\Windows Installer XML v3.5\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -o $(IntDir) "%(Identity)"
-"$(ProgramFiles)\Windows Installer XML v3.5\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
-      <Command Condition="'$(Configuration)|$(Platform)'=='win|x64'">"$(ProgramFiles)\Windows Installer XML v3.5\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -dextension -ddriverSourceDir="$(SolutionDir)switch-extension" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -ddriverVersion="$(DriverVersion)" -o $(IntDir) "%(Identity)"
-"$(ProgramFiles)\Windows Installer XML v3.5\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
+      <Command Condition="'$(Configuration)|$(Platform)'=='win-debug|x64'">"$(ProgramFiles)\WiX Toolset v3.11\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -dextension -ddriverSourceDir="$(SolutionDir)switch-extension" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -ddriverVersion="$(DriverVersion)" -o $(IntDir) "%(Identity)"
+"$(ProgramFiles)\WiX Toolset v3.11\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
+      <Command Condition="'$(Configuration)|$(Platform)'=='win-debug|Win32'">"$(ProgramFiles)\WiX Toolset v3.11\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -o $(IntDir) "%(Identity)"
+"$(ProgramFiles)\WiX Toolset v3.11\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
+      <Command Condition="'$(Configuration)|$(Platform)'=='win|Win32'">"$(ProgramFiles)\WiX Toolset v3.11\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -o $(IntDir) "%(Identity)"
+"$(ProgramFiles)\WiX Toolset v3.11\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
+      <Command Condition="'$(Configuration)|$(Platform)'=='win|x64'">"$(ProgramFiles)\WiX Toolset v3.11\bin\candle.exe" -dsourceDir="$(SolutionDir)build" -dextension -ddriverSourceDir="$(SolutionDir)switch-extension" -arch $(PlatformTarget) -darchitecture=$(PlatformTarget) -dversion=$(VersionFull) -ddriverVersion="$(DriverVersion)" -o $(IntDir) "%(Identity)"
+"$(ProgramFiles)\WiX Toolset v3.11\bin\light.exe" -ext WixUIExtension -spdb -out "$(SolutionDir)dist\hsflowd-$(Configuration)-$(VersionFull)-$(PlatformShortName).msi" "$(IntDir)\%(Filename).wixobj"</Command>
       <Message Condition="'$(Configuration)|$(Platform)'=='win-debug|Win32'">Build WiX installer</Message>
       <Message Condition="'$(Configuration)|$(Platform)'=='win|Win32'">Build WiX installer</Message>
       <Message Condition="'$(Configuration)|$(Platform)'=='win-debug|x64'">Build WiX installer</Message>
@@ -263,6 +261,14 @@
   <ItemGroup>
     <None Include="driverVersion.targets" />
     <None Include="license.rtf" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\hsflowd\hsflowd.vcxproj">
+      <Project>{ed47bebf-8bce-4c98-87d8-482330c4d300}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\installHelper\installHelper.vcxproj">
+      <Project>{8d65f824-868e-4b10-b567-4258149f49b8}</Project>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -1190,6 +1190,7 @@ enum SFLCounters_type_tag {
   SFLCOUNTERS_APP_WORKERS   = 2206,
   SFLCOUNTERS_HOST_GPU_NVML = (5703 << 12) + 1, /* = 23359489 */
   SFLCOUNTERS_BCM_TABLES    = (4413 << 12) + 3,
+  SFLCOUNTERS_VNT_HYPERV = (9540 << 12) + 1,
 };
 
 typedef union _SFLCounters_type {
