@@ -36,7 +36,7 @@
       DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
 
     <Property Id='SFLOW_PARAMS_KEY' Value='SYSTEM\CurrentControlSet\Services\hsflowd\Parameters' />
-    <Property Id='SFLOW_COLLECTOR' Value='localhost'>
+    <Property Id='SFLOW_COLLECTOR'>
       <RegistrySearch Id='ExistingCollectorValue'
                       Root='HKLM' Key='[SFLOW_PARAMS_KEY]'
                       Name='collector' Type='raw' />
@@ -46,12 +46,12 @@
                       Root='HKLM' Key='[SFLOW_PARAMS_KEY]'
                       Name='pollingInterval' Type='raw' />
     </Property>
-    <Property Id='SFLOW_SAMPLING' Value='256'>
+    <Property Id='SFLOW_SAMPLING' Value='20'>
       <RegistrySearch Id='ExistingSamplingValue'
                       Root='HKLM' Key='[SFLOW_PARAMS_KEY]'
                       Name='samplingRate' Type='raw' />
     </Property>
-    <Property Id='SFLOW_DNSSD' Value='on'>
+    <Property Id='SFLOW_DNSSD' Value='off'>
       <RegistrySearch Id='ExistingDNSSD'
                       Root='HKLM' Key='[SFLOW_PARAMS_KEY]'
                       Name='DNSSD' Type='raw' />

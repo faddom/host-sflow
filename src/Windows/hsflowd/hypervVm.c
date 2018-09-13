@@ -141,13 +141,13 @@ BOOL readXmlInstance(IXmlReader *xmlReader, SFLHost_hid_counters *hid,
 				uint32_t osName = SFLOS_unknown;
 				while (readXmlProperty(xmlReader, &nameVal, &dataVal)) {
 					if (nameVal != NULL) {
-						if (wcscmp(nameVal, XML_FQDN) == 0) {
+						/*if (wcscmp(nameVal, XML_FQDN) == 0) {
 							wcstombs_s(&hnLen, hnamebuf, hnamebufLen, dataVal, wcslen(dataVal));
 							//don't count the NULL
 							if (hnLen > 0) {
 								hnLen--;
 							}
-						} else if (wcscmp(nameVal, XML_OSNAME) == 0) {					
+						} else */if (wcscmp(nameVal, XML_OSNAME) == 0) {					
 							if (StrStrIW(dataVal, L"Windows") != NULL) {
 								osName = SFLOS_windows;
 							} else if (StrStrIW(dataVal, L"Linux") != NULL) {
