@@ -17,7 +17,7 @@ extern "C" {
     int gotData = NO;
     FILE *procFile;
     // limit the number of chars we will read from each line
-    // (there can be more than this - fgets will chop for us)
+    // (there can be more than this - my_readline will chop for us)
 #define MAX_PROC_LINE_CHARS 80
     char line[MAX_PROC_LINE_CHARS];
     char var[MAX_PROC_LINE_CHARS];
@@ -26,9 +26,10 @@ extern "C" {
     // zero the structure so we can accumulate into it.
     memset(mem, 0, sizeof(*mem));
 
-    procFile= fopen("/proc/meminfo", "r");
+    procFile= fopen(PROCFS_STR "/meminfo", "r");
     if(procFile) {
-      while(fgets(line, MAX_PROC_LINE_CHARS, procFile)) {
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	if(sscanf(line, "%s %"SCNu64"", var, &val64) == 2) {
 	  gotData = YES;
 	  if(strcmp(var, "MemTotal:") == 0) mem->mem_total += val64 * 1024;
@@ -43,9 +44,10 @@ extern "C" {
       fclose(procFile);
     }
 
-    procFile= fopen("/proc/vmstat", "r");
+    procFile= fopen(PROCFS_STR "/vmstat", "r");
     if(procFile) {
-      while(fgets(line, MAX_PROC_LINE_CHARS, procFile)) {
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	if(sscanf(line, "%s %"SCNu64"", var, &val64) == 2) {
 	  gotData = YES;
 	  if(strcmp(var, "pgpgin") == 0) mem->page_in += (uint32_t)val64;

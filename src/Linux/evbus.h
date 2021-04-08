@@ -143,7 +143,7 @@ extern "C" {
   int EVEventTx(EVMod *mod, EVEvent *evt, void *data, size_t dataLen);
   int EVEventTxAll(EVMod *mod, char *evt_name, void *data, size_t dataLen);
   EVSocket *EVBusAddSocket(EVMod *mod, EVBus *bus, int fd, EVReadCB readCB, void *magic);
-  bool EVSocketClose(EVMod *mod, EVSocket *sock);
+  bool EVSocketClose(EVMod *mod, EVSocket *sock, bool closeFD);
   void EVClockMono(struct timespec *ts);
 
 #define EVSOCKETREADLINE_INCBYTES EV_MAX_EVT_DATALEN
@@ -170,6 +170,7 @@ extern "C" {
 
   int EVTimeDiff_nS(struct timespec *t1, struct timespec *t2);
   int EVTimeDiff_mS(struct timespec *t1, struct timespec *t2);
+  void EVTimeAdd_nS(struct timespec *t, int nS);
   void EVBusRunThread(EVBus *bus, size_t stacksize);
   void EVBusRun(EVBus *bus);
   void EVBusStop(EVBus *bus);

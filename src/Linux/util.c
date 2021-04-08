@@ -9,6 +9,7 @@ extern "C" {
 #include "util.h"
 
   static int debugLevel = 0;
+  static bool daemonFlag = YES;
 
   /*________________---------------------------__________________
     ________________       UTStrBuf            __________________
@@ -130,9 +131,10 @@ extern "C" {
 
   void myLogv(int syslogType, char *fmt, va_list args)
   {
-    if(debugLevel) {
-      vfprintf(stderr, fmt, args);
-      fprintf(stderr, "\n");
+    if(debugLevel
+       || daemonFlag==NO) {
+      vfprintf(stdout, fmt, args);
+      fprintf(stdout, "\n");
     }
     else
       vsyslog(syslogType, fmt, args);
@@ -162,11 +164,20 @@ extern "C" {
     if(debug(level)) {
       va_list args;
       va_start(args, fmt);
-      fprintf(stderr, "dbg%d: ", level);
-      vfprintf(stderr, fmt, args);
-      fprintf(stderr, "\n");
+      fprintf(stdout, "dbg%d: ", level);
+      vfprintf(stdout, fmt, args);
+      fprintf(stdout, "\n");
     }
   }
+
+  void setDaemon(bool yesno) {
+    daemonFlag = yesno;
+  }
+
+  bool getDaemon() {
+    return daemonFlag;
+  }
+
 
   /*_________________---------------------------__________________
     _________________       my_os_allocation    __________________
@@ -176,7 +187,7 @@ extern "C" {
   void *my_os_calloc(size_t bytes)
   {
 #ifdef UTHEAP
-    myDebug(1, "my_os_calloc(%u)", bytes);
+    myDebug(4, "my_os_calloc(%u)", bytes);
 #endif
     void *mem = SYS_CALLOC(1, bytes);
     if(mem == NULL) {
@@ -190,7 +201,7 @@ extern "C" {
   void *my_os_realloc(void *ptr, size_t bytes)
   {
 #ifdef UTHEAP
-    myDebug(1, "my_os_realloc(%u)", bytes);
+    myDebug(4, "my_os_realloc(%u)", bytes);
 #endif
     void *mem = SYS_REALLOC(ptr, bytes);
     if(mem == NULL) {
@@ -446,6 +457,40 @@ extern "C" {
     return hash_fnv1a(bytes, len);
   }
 
+  int my_readline(FILE *ff, char *buf, uint32_t len, int *p_truncated) {
+    // read up to len-1 chars from line, but consume the whole line.
+    // return number of characters read (0 for empty line), or EOF if file
+    // was already at EOF. Always null-terminate the buffer. Indicate
+    // number of truncated characters with the pointer provided.
+    int ch;
+    uint32_t count=0;
+    bool atEOF=YES;
+    bool bufOK=(buf != NULL
+		&& len > 1);
+    if(p_truncated)
+      *p_truncated = 0;
+    while((ch = getc(ff)) != EOF) {
+      atEOF = NO;
+      // EOL on CR, LF or CRLF
+      if(ch == 10 || ch == 13) {
+	if(ch == 13) {
+	  // peek for CRLF
+	  if((ch = getc(ff)) != 10)
+	    ungetc(ch, ff);
+	}
+	break;
+      }
+      if(bufOK
+	 && count < (len-1))
+	buf[count++] = ch;
+      else if(p_truncated)
+	(*p_truncated)++;
+    }
+    if(bufOK)
+      buf[count] = '\0';
+    return atEOF ? EOF : count;
+  }
+
   /*_________________---------------------------__________________
     _________________     setStr                __________________
     -----------------___________________________------------------
@@ -461,16 +506,31 @@ extern "C" {
   ----------------___________________________------------------
 */
 
-  char *trimWhitespace(char *str)
+  char *trimWhitespace(char *str, uint32_t len)
   {
-    char *end;
+    // NULL -> NULL
+    if(str == NULL)
+      return NULL;
+    
+    // "" -> NULL
+    if(len == 0
+       || *str == '\0')
+      return NULL;
+    
+    char *end = str + len - 1;
 
     // Trim leading space
-    while(isspace(*str)) str++;
+    while(isspace(*str)) {
+      // also return NULL for a string with only spaces in it
+      // (don't want that condition to slip through unnoticed)
+      if(++str >= end)
+	return NULL;
+    }
 
     // Trim trailing space
-    end = str + strlen(str) - 1;
-    while(end > str && isspace(*end)) end--;
+    while(end > str
+	  && isspace(*end))
+      end--;
 
     // Write new null terminator
     *(end+1) = 0;
@@ -682,7 +742,7 @@ extern "C" {
       *str = a;
     }
 
-    return trim ? trimWhitespace(buf) : buf;
+    return trim ? trimWhitespace(buf, len) : buf;
   }
 
   /*_________________---------------------------__________________
@@ -752,6 +812,22 @@ extern "C" {
 	obj = ar->objs[i];
 	ar->objs[i] = NULL;
 	arrayDeleteCheck(ar);
+      }
+    }
+    return obj;
+  }
+
+  void UTArrayPush(UTArray *ar, void *obj) {
+    UTArrayAdd(ar, obj);
+  }
+
+  void *UTArrayPop(UTArray *ar) {
+    void *obj = NULL;
+    SEMLOCK_DO(ar->sync) {
+      if(ar->n > 0) {
+	ar->n--;
+	obj = ar->objs[ar->n];
+	ar->objs[ar->n] = NULL;
       }
     }
     return obj;
@@ -828,7 +904,7 @@ extern "C" {
     ----------------___________________________------------------
   */
 
-  static int parseOrResolveAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family, int numeric)
+  static bool parseOrResolveAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family, int numeric)
   {
     struct addrinfo *info = NULL;
     struct addrinfo hints = { 0 };
@@ -860,6 +936,7 @@ extern "C" {
       case PF_INET:
 	{
 	  struct sockaddr_in *ipsoc = (struct sockaddr_in *)info->ai_addr;
+	  memset(addr, 0, sizeof(*addr)); // avoid artifacts in unused bytes
 	  addr->type = SFLADDRESSTYPE_IP_V4;
 	  addr->address.ip_v4.addr = ipsoc->sin_addr.s_addr;
 	  if(sa) memcpy(sa, info->ai_addr, info->ai_addrlen);
@@ -868,6 +945,7 @@ extern "C" {
       case PF_INET6:
 	{
 	  struct sockaddr_in6 *ip6soc = (struct sockaddr_in6 *)info->ai_addr;
+	  memset(addr, 0, sizeof(*addr)); // avoid artifacts in unused bytes
 	  addr->type = SFLADDRESSTYPE_IP_V6;
 	  memcpy(&addr->address.ip_v6, &ip6soc->sin6_addr, 16);
 	  if(sa) memcpy(sa, info->ai_addr, info->ai_addrlen);
@@ -884,12 +962,12 @@ extern "C" {
     return YES;
   }
 
-  int lookupAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family)
+  bool lookupAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family)
   {
     return parseOrResolveAddress(name, sa, addr, family, NO);
   }
 
-  int parseNumericAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family)
+  bool parseNumericAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family)
   {
     return parseOrResolveAddress(name, sa, addr, family, YES);
   }
@@ -1110,8 +1188,9 @@ extern "C" {
 	myLog(LOG_ERR, "fdopen() failed : %s", strerror(errno));
 	exit(EXIT_FAILURE);
       }
-      while(fgets(line, lineLen, ovs)) {
-	myDebug(2, "myExec input> <%s>", line);
+      int truncated;
+      while(my_readline(ovs, line, lineLen, &truncated) != EOF) {
+	myDebug(2, "myExec input> <%s>%s", line, truncated ? " TRUNCATED":"");
 	if((*lineCB)(magic, line) == NO) {
 	  myDebug(2, "myExec callback returned NO");
 	  ans = NO;
@@ -1352,6 +1431,17 @@ extern "C" {
     return NO;
   }
 
+  int SFLAddress_isRFC1918(SFLAddress *addr) {
+    if(addr->type == SFLADDRESSTYPE_IP_V4) {
+      u_char *a = (u_char *)&(addr->address.ip_v4.addr);
+      if(a[0] == 10 // 10.0.0.0/8
+	 || (a[0] == 192 && a[1] == 168) // 192.168.0.0/16
+	 || (a[0] == 172 && (a[1] & 0xF0) == 16)) // 172.16.0.0/12
+	return YES;
+    }
+    return NO;
+  }
+
   int SFLAddress_isLinkLocal(SFLAddress *addr) {
     if(addr->type == SFLADDRESSTYPE_IP_V6) {
       // FE80::/10
@@ -1511,7 +1601,7 @@ extern "C" {
 
   int isAllZero(u_char *buf, int len) {
     for(int ii = 0; ii < len; ii++) {
-      if(buf[len] != 0) return NO;
+      if(buf[ii] != 0) return NO;
     }
     return YES;
   }
@@ -1698,6 +1788,29 @@ static uint32_t hashSearch(UTHash *oh, void *obj, void **found) {
     _________________   socket handling         __________________
     -----------------___________________________------------------
   */
+  
+  void UTSocketRcvbuf(int fd, int requested) {
+    int rcvbuf=0;
+    socklen_t rcvbufsiz = sizeof(rcvbuf);
+    if(getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rcvbufsiz) < 0) {
+      myLog(LOG_ERR, "UTSocketRcvbuf: getsockopt(SO_RCVBUF) failed: %s", strerror(errno));
+    }
+    myDebug(1, "UTSocketRcvbuf: socket buffer current=%d", rcvbuf);
+    if(rcvbuf < requested) {
+      // want more: submit the request
+      rcvbuf = requested;
+      if(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+	myLog(LOG_ERR, "UTSocketRcvbuf: setsockopt(SO_RCVBUF=%d) failed: %s",
+	      requested, strerror(errno));
+      }
+      // see what we actually got
+      rcvbufsiz = sizeof(rcvbuf);
+      if(getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rcvbufsiz) < 0) {
+	myLog(LOG_ERR, "UTSocketRcvbuf: getsockopt(SO_RCVBUF) failed: %s", strerror(errno));
+      }
+      myDebug(1, "UTSocketRcvbuf: socket buffer requested=%d received=%d", requested, rcvbuf);
+    }
+  }
 
   int UTSocketUDP(char *bindaddr, int family, uint16_t port, int bufferSize)
   {
@@ -1753,24 +1866,7 @@ static uint32_t hashSearch(UTHash *oh, void *obj, void **found) {
 
     // increase receiver buffer size - but only if the requested size
     // is larger than we already got (sysctl net.core.rmem_default)
-    int rcvbuf=0;
-    socklen_t rcvbufsiz = sizeof(rcvbuf);
-    if(getsockopt(soc, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rcvbufsiz) < 0) {
-      myLog(LOG_ERR, "getsockopt(SO_RCVBUF) failed: %s", strerror(errno));
-    }
-    if(rcvbuf < bufferSize) {
-      // want more: submit the request
-      rcvbuf = bufferSize;
-      if(setsockopt(soc, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-	myLog(LOG_ERR, "setsockopt(SO_RCVBUF=%d) failed: %s", bufferSize, strerror(errno));
-      }
-      // see what we actually got
-      rcvbufsiz = sizeof(rcvbuf);
-      if(getsockopt(soc, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rcvbufsiz) < 0) {
-	myLog(LOG_ERR, "getsockopt(SO_RCVBUF) failed: %s", strerror(errno));
-      }
-      myDebug(1, "UDP buffering requested=%d received=%d", bufferSize, rcvbuf);
-    }
+    UTSocketRcvbuf(soc, bufferSize);
 
     return soc;
   }

@@ -57,8 +57,8 @@ extern "C" {
 #include "sflow.h" // for SFLAddress, SFLAdaptorList...
 
   // addressing
-  int lookupAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family);
-  int parseNumericAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family);
+  bool lookupAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family);
+  bool parseNumericAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family);
   int hexToBinary(u_char *hex, u_char *bin, uint32_t binLen);
   int printHex(const u_char *a, int len, u_char *buf, int bufLen, int prefix);
   int parseUUID(char *str, char *uuid);
@@ -75,8 +75,8 @@ extern "C" {
   int getDebug(void);
   int debug(int level);
   void myDebug(int level, char *fmt, ...);
-  void setDemonize(void);
-  int getDemonize(void);
+  void setDaemon(bool yesno);
+  bool getDaemon(void);
 
   // OS allocation
   void *my_os_calloc(size_t bytes);
@@ -112,6 +112,7 @@ extern "C" {
   int my_strequal(const char *s1, const char *s2);
   uint32_t my_strhash(const char *str);
   uint32_t my_binhash(const char *bytes, const uint32_t len);
+  int my_readline(FILE *ff, char *buf, uint32_t len, int *p_truncated);
 
   // mutual-exclusion semaphores
   static inline int lockOrDie(pthread_mutex_t *sem) {
@@ -137,7 +138,7 @@ extern "C" {
 #define SEMLOCK_DO(_sem) for(int DYNAMIC_LOCAL(_ctrl)=1; DYNAMIC_LOCAL(_ctrl) && lockOrDie(_sem); DYNAMIC_LOCAL(_ctrl)=0, releaseOrDie(_sem))
 
   // string utils
-  char *trimWhitespace(char *str);
+  char *trimWhitespace(char *str, uint32_t len);
   void setStr(char **fieldp, char *str);
 
   // string buffer
@@ -208,6 +209,8 @@ extern "C" {
   void UTArrayFree(UTArray *ar);
   uint32_t UTArrayN(UTArray *ar);
   void *UTArrayAt(UTArray *ar, int i);
+  void UTArrayPush(UTArray *ar, void *obj);
+  void *UTArrayPop(UTArray *ar);
   uint32_t UTArraySnapshot(UTArray *ar, uint32_t buf_n, void *buf);
 #define UTARRAY_WALK(ar, obj) for(uint32_t _ii=0; _ii<UTArrayN(ar); _ii++) if(((obj)=(typeof(obj))UTArrayAt((ar), _ii)))
 
@@ -242,6 +245,7 @@ extern "C" {
   int UTFileExists(char *path);
 
   // sockets
+  void UTSocketRcvbuf(int fd, int requested);
   int UTSocketUDP(char *bindaddr, int family, uint16_t port, int bufferSize);
   int UTUnixDomainSocket(char *path);
 
@@ -251,6 +255,7 @@ extern "C" {
   int SFLAddress_isLoopback(SFLAddress *addr);
   int SFLAddress_isZero(SFLAddress *addr);
   int SFLAddress_isSelfAssigned(SFLAddress *addr);
+  int SFLAddress_isRFC1918(SFLAddress *addr);
   int SFLAddress_isLinkLocal(SFLAddress *addr);
   int SFLAddress_isUniqueLocal(SFLAddress *addr);
   int SFLAddress_isMulticast(SFLAddress *addr);

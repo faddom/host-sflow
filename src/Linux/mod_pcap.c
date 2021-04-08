@@ -119,9 +119,10 @@ extern "C" {
 		 14 /* mac len */,
 		 buf + 14 /* payload */,
 		 hdr->caplen - 14, /* length of captured payload */
-		 hdr->len, /* length of packet (pdu) */
+		 hdr->len - 14, /* length of packet (pdu) */
 		 bpfs->drops, /* droppedSamples */
-		 bpfs->samplingRate);
+		 bpfs->samplingRate,
+		 NULL);
     }
   }
 
@@ -256,20 +257,55 @@ extern "C" {
     
     bpfs->samplingRate = lookupPacketSamplingRate(bpfs->adaptor, sp->sFlowSettings);
     bpfs->subSamplingRate = bpfs->samplingRate;
-    bpfs->pcap = pcap_open_live(bpfs->deviceName,
-				sp->sFlowSettings_file->headerBytes,
-				bpfs->promisc,
-				0, /* timeout==poll */
-				bpfs->pcap_err);
-    if(bpfs->pcap == NULL) {
+
+    // create pcap
+    if((bpfs->pcap = pcap_create(bpfs->deviceName, bpfs->pcap_err)) == NULL) {
       myLog(LOG_ERR, "PCAP: device %s open failed: %s", bpfs->deviceName, bpfs->pcap_err);
       return;
     }
+
+    // immediate mode
+    if(kernelVer64(sp) < 3019000L) {
+      myDebug(1, "PCAP: kernel too old for BPF sampling, so not setting immediate mode");
+    }
+    else if(pcap_set_immediate_mode(bpfs->pcap, YES) != 0) {
+      myLog(LOG_ERR, "PCAP: pcap_set_immediate_mode(%s) failed", bpfs->deviceName);
+    }
+
+    // snaplen
+    if(pcap_set_snaplen(bpfs->pcap, sp->sFlowSettings_file->headerBytes) != 0)
+      myLog(LOG_ERR, "PCAP: pcap_set_snaplen(%s) failed", bpfs->deviceName);
+
+    // promiscuous mode
+    if(pcap_set_promisc(bpfs->pcap, bpfs->promisc) != 0)
+      myLog(LOG_ERR, "PCAP: pcap_set_promisc(%s) failed", bpfs->deviceName);
+
+    // read timeout
+    if(pcap_set_timeout(bpfs->pcap, 0) != 0)    // indicate we are going to poll
+      myLog(LOG_ERR, "PCAP: pcap_set_timeout(%s) failed", bpfs->deviceName);
+
+    // activate
+    int status = pcap_activate(bpfs->pcap);
+    if(status < 0) {
+      myLog(LOG_ERR, "PCAP: activate(%s) ERROR: %s", bpfs->deviceName, pcap_geterr(bpfs->pcap));
+      return;
+    }
+    else if(status > 0) {
+      myLog(LOG_INFO, "PCAP: activate(%s) warning: %s", bpfs->deviceName, pcap_geterr(bpfs->pcap));
+    }
     
     myDebug(1, "PCAP: device %s opened OK", bpfs->deviceName);
+
+    // get file descriptor
     int fd = pcap_fileno(bpfs->pcap);
-    setKernelSampling(sp, bpfs, fd);
+
+    // configure BPF sampling
+    if(bpfs->samplingRate > 1)
+      setKernelSampling(sp, bpfs, fd);
+
+    // register
     bpfs->sock = EVBusAddSocket(mod, mdata->packetBus, fd, readPackets_pcap, bpfs);
+
     // assume we always want to get counters for anything we are tapping.
     // Have to force this here in case there are no samples that would
     // trigger it in readPackets.c:takeSample()
@@ -288,7 +324,7 @@ extern "C" {
       pcap_close(bpfs->pcap);
       bpfs->pcap = NULL;
     }
-    EVSocketClose(mod, bpfs->sock);
+    EVSocketClose(mod, bpfs->sock, YES);
     bpfs->sock = NULL;
   }
 
@@ -338,21 +374,23 @@ extern "C" {
 	}
 	SFLAdaptor *adaptor;
 	UTHASH_WALK(sp->adaptorsByName, adaptor) {
+ 	  myDebug(2, "PCAP: consider %s (speed=%"PRIu64")", adaptor->deviceName, adaptor->ifSpeed);
 	  if((adaptor->ifSpeed == pcap->speed_min && pcap->speed_max == 0)
 	     || (adaptor->ifSpeed >= pcap->speed_min
 		 && adaptor->ifSpeed <= pcap->speed_max)) {
+	    myDebug(2, "PCAP: %s speed OK", adaptor->deviceName);
 	    // passed the speed test,  but there may be other
 	    // reasons to reject this one:
 	    HSPAdaptorNIO *nio = (HSPAdaptorNIO *)adaptor->userData;
 	    if(nio->bond_master) {
-	      myDebug(1, "not %s (bond_master)", adaptor->deviceName);
+	      myDebug(1, "PCAP: skip %s (bond_master)", adaptor->deviceName);
 	    }
 	    else if(nio->vlan != HSP_VLAN_ALL) {
-	      myDebug(1, "not %s (vlan=%u)", adaptor->deviceName, nio->vlan);
+	      myDebug(1, "PCAP: skip %s (vlan=%u)", adaptor->deviceName, nio->vlan);
 	    }
 	    else if(nio->devType != HSPDEV_PHYSICAL
 		    && nio->devType != HSPDEV_OTHER) {
-	      myDebug(1, "not %s (devType=%s)",
+	      myDebug(1, "PCAP: skip %s (devType=%s)",
 		      adaptor->deviceName,
 		      devTypeName(nio->devType));
 	    }

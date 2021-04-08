@@ -20,7 +20,7 @@ extern "C" {
     FILE *procFile;
     // We assume that the cpu counters struct has been initialized
     // with all zeros.
-    procFile= fopen("/proc/loadavg", "r");
+    procFile= fopen(PROCFS_STR "/loadavg", "r");
     if(procFile) {
       // The docs are pretty clear about %f being "float" rather
       // that "double", so just give the pointers to fscanf.
@@ -41,7 +41,7 @@ extern "C" {
       fclose(procFile);
     }
 
-    procFile = fopen("/proc/stat", "r");
+    procFile = fopen(PROCFS_STR "/stat", "r");
     if(procFile) {
       // ASCII numbers in /proc/stat may be 64-bit (if not now
       // then someday), so it seems safer to read into
@@ -64,11 +64,12 @@ extern "C" {
 #define JIFFY_TO_MS(i) (((i) * 1000L) / HZ)
 
       // limit the number of chars we will read from each line
-      // (there can be more than this - fgets will chop for us)
+      // (there can be more than this - my_readline will chop for us)
 #define MAX_PROC_LINE_CHARS 240
       char line[MAX_PROC_LINE_CHARS];
       uint32_t lineNo = 0;
-      while(fgets(line, MAX_PROC_LINE_CHARS, procFile)) {
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	if(++lineNo == 1) {
 	  if(sscanf(line, "cpu %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64"",
 		    &cpu_user,
@@ -120,7 +121,7 @@ extern "C" {
       fclose(procFile);
     }
 
-    procFile = fopen("/proc/uptime", "r");
+    procFile = fopen(PROCFS_STR "/uptime", "r");
     if(procFile) {
       float uptime = 0;
       if(fscanf(procFile, "%f",	&uptime) == 1) {
@@ -147,12 +148,13 @@ extern "C" {
     //cpu_speed.  According to Ganglia/libmetrics we should
     // look first in /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
     // but for now just take the first one from /proc/cpuinfo
-    procFile = fopen("/proc/cpuinfo", "r");
+    procFile = fopen(PROCFS_STR "/cpuinfo", "r");
     if(procFile) {
 #undef MAX_PROC_LINE_CHARS
 #define MAX_PROC_LINE_CHARS 80
       char line[MAX_PROC_LINE_CHARS];
-      while(fgets(line, MAX_PROC_LINE_CHARS, procFile)) {
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	if(strncmp(line, "cpu MHz", 7) == 0) {
 	  double cpu_mhz = 0.0;
 	  if(sscanf(line, "cpu MHz : %lf", &cpu_mhz) == 1) {

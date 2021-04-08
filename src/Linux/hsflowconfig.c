@@ -10,6 +10,7 @@ extern "C" {
 
 #define HSP_MAX_SAMPLING_N 10000000
 #define HSP_MAX_POLLING_S 300
+#define HSP_MAX_NOTIFY_RATELIMIT 10000
 
 #define HSP_MAX_LINELEN 2048
 #define HSP_MAX_CONFIG_DEPTH 3
@@ -60,13 +61,17 @@ extern "C" {
     HSPOBJ_DOCKER,
     HSPOBJ_ULOG,
     HSPOBJ_NFLOG,
+    HSPOBJ_PSAMPLE,
+    HSPOBJ_DROPMON,
     HSPOBJ_PCAP,
     HSPOBJ_TCP,
     HSPOBJ_CUMULUS,
+    HSPOBJ_DENT,
     HSPOBJ_NVML,
     HSPOBJ_OVS,
     HSPOBJ_OS10,
     HSPOBJ_OPX,
+    HSPOBJ_SONIC,
     HSPOBJ_DBUS,
     HSPOBJ_SYSTEMD,
     HSPOBJ_EAPI,
@@ -87,6 +92,7 @@ extern "C" {
     "pcap",
     "tcp",
     "cumulus",
+    "dent",
     "nvml",
     "ovs",
     "os10",
@@ -382,7 +388,9 @@ extern "C" {
       *p_devName = my_strdup(t->str);
       return t;
       // We now read the config file before we read the interfaces, so checking
-      // to ensure that this is a valid deviceName is now done later
+      // to ensure that this is a valid deviceName is now done later. Could therefore
+      // just use expectString() for this, but leave it here as a placeholder in
+      // case we want to tighten up the checks.
     }
     parseError(sp, tok, "expected device name", "");
     return NULL;
@@ -420,19 +428,20 @@ extern "C" {
     return NULL;
   }
 
-  // expectFormat
+  // expectString
 
-  static HSPToken *expectFormat(HSP *sp, HSPToken *tok, char **p_format)
+  static HSPToken *expectString(HSP *sp, HSPToken *tok, char **p_str, char *tokenType)
   {
     HSPToken *t = tok;
     t = t->nxt;
     if(t && t->str) {
-      *p_format = my_strdup(t->str);
+      *p_str = my_strdup(t->str);
       return t;
     }
-    parseError(sp, tok, "expected format", "");
+    parseError(sp, tok, "expected", tokenType);
     return NULL;
   }
+
 
   // expectRegex
 
@@ -445,19 +454,6 @@ extern "C" {
       return (*pattern) ? t : NULL;
     }
     parseError(sp, tok, "expected regex pattern", "");
-    return NULL;
-  }
-  // expectDevice
-
-  static HSPToken *expectNamespace(HSP *sp, HSPToken *tok, char **p_namespace)
-  {
-    HSPToken *t = tok;
-    t = t->nxt;
-    if(t && t->str) {
-      *p_namespace = my_strdup(t->str);
-      return t;
-    }
-    parseError(sp, tok, "expected namespace", "");
     return NULL;
   }
 
@@ -487,11 +483,11 @@ extern "C" {
 	// side effects.
 	myLog(LOG_ERR, "clearCollectors: socket still open");
       }
-      my_free(coll);
       if(coll->namespace)
 	my_free(coll->namespace);
       if(coll->deviceName)
 	my_free(coll->deviceName);
+      my_free(coll);
       coll = nextColl;
     }
     settings->collectors = NULL;
@@ -596,7 +592,12 @@ extern "C" {
 	  UTStrBuf_printf(buf, "polling.%s=%u\n", appSettings->application, appSettings->polling_secs);
 	}
       }
-      // agentIP can ovrride the config file here if set,  but otherwise print the address we selected
+      // agentIP can override the config file here if set,  but otherwise print the address we selected
+      // TODO: should avoid writing in previously set agentIP or agentDevice. Should only write that in
+      // if it was an override. In installSFlowSettings we have to be careful to detect that a new config
+      // was submitted but still print the agentIP and agent lines to /etc/hsflowd.auto.  Before doing that
+      // however, we have to check for any change to agentIP, agent or agentCIDR,  and if so run the
+      // selectAgentAddress election again to pick an agentIP.
       SFLAddress agIP = settings->agentIP.type ? settings->agentIP : sp->agentIP;
       char ipbuf[51];
       UTStrBuf_printf(buf, "agentIP=%s\n", SFLAddress_print(&agIP, ipbuf, 50));
@@ -625,8 +626,12 @@ extern "C" {
 	// so let's hope the slave agents all do the right thing with that(!)
 	if(collector->ipAddr.type != SFLADDRESSTYPE_UNDEFINED) {
 	  char collectorStr[128];
-	  // <ip> <port> [<priority>]
-	  sprintf(collectorStr, "collector=%s %u\n", SFLAddress_print(&collector->ipAddr, ipbuf, 50), collector->udpPort);
+	  // ip/port/deviceName/namespace
+	  sprintf(collectorStr, "collector=%s/%u/%s/%s\n",
+		  SFLAddress_print(&collector->ipAddr, ipbuf, 50),
+		  collector->udpPort,
+		  collector->deviceName ?: "",
+		  collector->namespace ?: "");
 	  strArrayAdd(iplist, collectorStr);
 	}
       }
@@ -946,7 +951,8 @@ extern "C" {
     HSPToken *tokens = newToken("start", 5);
     char line[HSP_MAX_LINELEN];
     uint32_t lineNo = 0;
-    while(fgets(line, HSP_MAX_LINELEN, cfg)) {
+    int truncated;
+    while(my_readline(cfg, line, HSP_MAX_LINELEN, &truncated) != EOF) {
       lineNo++;
       char *p = line;
       // comments start with '#'
@@ -964,7 +970,7 @@ extern "C" {
 
     return tokens;
   }
-
+  
   /*_________________---------------------------__________________
     _________________  agentAddressPriority     __________________
     -----------------___________________________------------------
@@ -987,6 +993,9 @@ extern "C" {
       }
       else if(vlan != HSP_VLAN_ALL) {
 	ipPriority = IPSP_VLAN4;
+      }
+      else if(SFLAddress_isRFC1918(addr)) {
+	ipPriority = IPSP_IP4_RFC1918;
       }
       break;
 
@@ -1047,6 +1056,31 @@ extern "C" {
     return boosted_priority;
   }
 
+
+  static bool priorityHigher(HSP *sp, HSPLocalIP *localIP, HSPLocalIP *challenger, char *dev) {
+    if(dev
+       && !my_strequal(dev, challenger->dev))
+      return NO;
+    if(localIP == NULL)
+      return YES;
+    if(challenger->ipPriority < localIP->ipPriority)
+      return NO;
+    if(challenger->ipPriority > localIP->ipPriority)
+      return YES;
+    SFLAdaptor *adaptor1 = adaptorByName(sp, localIP->dev);
+    if(adaptor1 == NULL)
+      return YES;
+    SFLAdaptor *adaptor2 = adaptorByName(sp, challenger->dev);
+    if(adaptor2 == NULL)
+      return NO;
+    // if it's the same interface, take the one we found first
+    if(adaptor1->ifIndex == adaptor2->ifIndex)
+      return (challenger->discoveryIndex < localIP->discoveryIndex);
+    // otherwise take the one whose interface has the lower ifIndex
+    return (adaptor2->ifIndex > 0
+	    && adaptor2->ifIndex < adaptor1->ifIndex);
+  }
+
   /*_________________---------------------------__________________
     _________________     selectAgentAddress    __________________
     -----------------___________________________------------------
@@ -1058,9 +1092,10 @@ extern "C" {
     HSPSFlowSettings *st = sp->sFlowSettings;
     HSPSFlowSettings *st_file = sp->sFlowSettings_file;
     SFLAdaptor *selectedAdaptor = NULL;
-    
+
     myDebug(1, "selectAgentAddress");
 
+    // see if config specifies ip or adaptor
     if(st
        && st->agentIP.type) {
       myDebug(1, "selectAgentAddress in current settings");
@@ -1074,58 +1109,42 @@ extern "C" {
       selectedAdaptor = adaptorByIP(sp, ip);
     }
     else if(st
-	    && st->agentDevice
-	    && adaptorByName(sp, st->agentDevice)) {
+	    && st->agentDevice) {
       myDebug(1, "selectAgentAddress pegged to device in current settings");
       selectedAdaptor = adaptorByName(sp, st->agentDevice);
-      ip = &(ADAPTOR_NIO(selectedAdaptor)->ipAddr);
     }
     else if(st_file
-	    && st_file->agentDevice
-	    && adaptorByName(sp, st_file->agentDevice)) {
+	    && st_file->agentDevice) {
       myDebug(1, "selectAgentAddress pegged to device in config file");
       selectedAdaptor = adaptorByName(sp, st_file->agentDevice);
-      ip = &(ADAPTOR_NIO(selectedAdaptor)->ipAddr);
-    }
-    else {
-      // try to automatically choose an IP (or IPv6) address,  based on the priority ranking.
-      // We already used this ranking to prioritize L3 addresses per adaptor (in the case where
-      // there are more than one) so now we are applying the same ranking globally to pick
-      // the best candidate to represent the whole agent:
-      
-      SFLAdaptor *adaptor;
-      UTHASH_WALK(sp->adaptorsByName, adaptor) {
-	HSPAdaptorNIO *adaptorNIO = ADAPTOR_NIO(adaptor);
-	// must have an IP
-	if(!SFLAddress_isZero(&adaptorNIO->ipAddr)) {
-	  if(selectedAdaptor == NULL) {
-	    selectedAdaptor = adaptor;
-	  }
-	  else {
-	    uint32_t ifi = selectedAdaptor->ifIndex;
-	    uint32_t pri = ADAPTOR_NIO(selectedAdaptor)->ipPriority;
-	    // take the highest priority one,  but if we have more than one with the same
-	    // priority then choose the one with the lowest (non-zero) ifIndex number:
-	    if((adaptorNIO->ipPriority > pri)
-	       || (adaptorNIO->ipPriority == pri
-		   && adaptor->ifIndex
-		   && (ifi == 0 || adaptor->ifIndex < ifi))) {
-	      selectedAdaptor = adaptor;
-	    }
-	  }
-	}
-      }
     }
     
+    if(ip == NULL) {
+      // Elect an IP (or IPv6) address based on priority (maybe pegged to one dev)
+      char *peggedDev = selectedAdaptor ? selectedAdaptor->deviceName : NULL;
+      HSPLocalIP *selectedLocalIP = NULL;
+      HSPLocalIP *lip;
+      UTHASH_WALK(sp->localIP, lip) {
+	if(priorityHigher(sp, selectedLocalIP, lip, peggedDev))
+	  selectedLocalIP = lip;
+      }
+      UTHASH_WALK(sp->localIP6, lip) {
+	if(priorityHigher(sp, selectedLocalIP, lip, peggedDev))
+	  selectedLocalIP = lip;
+      }
+      if(selectedLocalIP) {
+	// picked one.  Fill in ip and adaptor
+	ip = &selectedLocalIP->ipAddr;
+	selectedAdaptor = adaptorByName(sp, selectedLocalIP->dev);
+      }
+    }
+
+    // record the agentDevice name
     if(sp->agentDevice) {
       my_free(sp->agentDevice);
       sp->agentDevice = NULL;
     }
-    
     if(selectedAdaptor) {
-      // crown the winner
-      ip = &(ADAPTOR_NIO(selectedAdaptor)->ipAddr);
-      // keep the device name too
       sp->agentDevice = my_strdup(selectedAdaptor->deviceName);
     }
 
@@ -1133,16 +1152,21 @@ extern "C" {
     bool changed = (SFLAddress_equal(ip, &sp->agentIP) == NO);
     if(p_changed) *p_changed = changed;
 
-    char ipbuf1[51];
-    char ipbuf2[51];
-    myDebug(1, "selectAgentAddress selected agentIP with highest priority: device=%s, address=%s, previous=%s, changed=%s",
-	    sp->agentDevice ?: "<none>",
-	    SFLAddress_print(ip, ipbuf1, 50),
-	    SFLAddress_print(&sp->agentIP, ipbuf2, 50),
-	    changed ? "YES" : "NO");
+    if(ip) {
+      char ipbuf1[51];
+      char ipbuf2[51];
+      myDebug(1, "selectAgentAddress selected agentIP with highest priority: device=%s, address=%s, previous=%s, changed=%s",
+	      sp->agentDevice ?: "<none>",
+	      SFLAddress_print(ip, ipbuf1, 50),
+	      SFLAddress_print(&sp->agentIP, ipbuf2, 50),
+	      changed ? "YES" : "NO");
 
-    // and finally write it into place
-    sp->agentIP = *ip;
+      // write it into place
+      sp->agentIP = *ip;
+    }
+    else {
+      myDebug(1, "selectAgentAddress selection failed");
+    }
 
     // return true if we were successful
     return (ip ? YES : NO);
@@ -1163,7 +1187,8 @@ extern "C" {
     // strict rules,  but for simplicity we just allow the current object
     // to double as a state variable that determines what is allowed next.
 
-    for(HSPToken *tok = readTokens(sp); tok; tok = tok->nxt) {
+    HSPToken *tok = sp->config_tokens = readTokens(sp);
+    for( ; tok; tok = tok->nxt) {
 
       if(tok->stok
 	 && HSPSpecialTokens[tok->stok].deprecated)
@@ -1260,6 +1285,25 @@ extern "C" {
 	    sp->nflog.nflog = YES;
 	    level[++depth] = HSPOBJ_NFLOG;
 	    break;
+	  case HSPTOKEN_PSAMPLE:
+	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
+	    sp->psample.psample = YES;
+	    sp->psample.group = 1;
+	    sp->psample.ingress = YES;
+	    sp->psample.egress = NO;
+	    level[++depth] = HSPOBJ_PSAMPLE;
+	    break;
+	  case HSPTOKEN_DROPMON:
+	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
+	    sp->dropmon.dropmon = YES;
+	    sp->dropmon.group = 1;
+	    sp->dropmon.start = YES;
+	    sp->dropmon.limit = 100;
+	    sp->dropmon.max = 100000;
+	    sp->dropmon.sw = YES;
+	    sp->dropmon.hw = YES;
+	    level[++depth] = HSPOBJ_DROPMON;
+	    break;
 	  case HSPTOKEN_PCAP:
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
 	    sp->pcap.pcap = YES;
@@ -1275,6 +1319,11 @@ extern "C" {
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
 	    sp->cumulus.cumulus = YES;
 	    level[++depth] = HSPOBJ_CUMULUS;
+	    break;
+	  case HSPTOKEN_DENT:
+	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
+	    sp->dent.dent = YES;
+	    level[++depth] = HSPOBJ_DENT;
 	    break;
 	  case HSPTOKEN_OVS:
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
@@ -1293,13 +1342,19 @@ extern "C" {
 	    break;
 	  case HSPTOKEN_OS10:
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
-	    sp->opx.opx = YES;
+	    sp->opx.opx = YES; // os10 now maps to opx internally
 	    level[++depth] = HSPOBJ_OS10;
 	    break;
 	  case HSPTOKEN_OPX:
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
 	    sp->opx.opx = YES;
 	    level[++depth] = HSPOBJ_OPX;
+	    break;
+	  case HSPTOKEN_SONIC:
+	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
+	    sp->sonic.sonic = YES;
+	    sp->sonic.unixsock = YES;
+	    level[++depth] = HSPOBJ_SONIC;
 	    break;
 	  case HSPTOKEN_DBUS:
 	    if((tok = expectToken(sp, tok, HSPTOKEN_STARTOBJ)) == NULL) return NO;
@@ -1425,7 +1480,7 @@ extern "C" {
 	      if((tok = expectInteger32(sp, tok, &col->udpPort, 1, 65535)) == NULL) return NO;
 	      break;
 	    case HSPTOKEN_NAMESPACE:
-	      if((tok = expectNamespace(sp, tok, &col->namespace)) == NULL) return NO;
+	      if((tok = expectString(sp, tok, &col->namespace, "namespace")) == NULL) return NO;
 	      break;
 	    case HSPTOKEN_DEV:
 	      if((tok = expectDevice(sp, tok, &col->deviceName)) == NULL) return NO;
@@ -1497,6 +1552,12 @@ extern "C" {
 	    case HSPTOKEN_FORGET_VMS:
 	      if((tok = expectInteger32(sp, tok, &sp->docker.forgetVMSecs, 60, 0xFFFFFFFF)) == NULL) return NO;
 	      break;
+	    case HSPTOKEN_HOSTNAME:
+	      if((tok = expectONOFF(sp, tok, &sp->docker.hostname)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_CGROUP_TRAFFIC:
+	      if((tok = expectONOFF(sp, tok, &sp->docker.markTraffic)) == NULL) return NO;
+	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
 	      return NO;
@@ -1543,6 +1604,55 @@ extern "C" {
 	  }
 	  break;
 
+	case HSPOBJ_PSAMPLE:
+	  {
+	    switch(tok->stok) {
+	    case HSPTOKEN_GROUP:
+	      if((tok = expectInteger32(sp, tok, &sp->psample.group, 1, 32)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_INGRESS:
+	      if((tok = expectONOFF(sp, tok, &sp->psample.ingress)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_EGRESS:
+	      if((tok = expectONOFF(sp, tok, &sp->psample.egress)) == NULL) return NO;
+	      break;
+	    default:
+	      unexpectedToken(sp, tok, level[depth]);
+	      return NO;
+	      break;
+	    }
+	  }
+	  break;
+
+	case HSPOBJ_DROPMON:
+	  {
+	    switch(tok->stok) {
+	    case HSPTOKEN_GROUP:
+	      if((tok = expectInteger32(sp, tok, &sp->dropmon.group, 1, 32)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_START:
+	      if((tok = expectONOFF(sp, tok, &sp->dropmon.start)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_SW:
+	      if((tok = expectONOFF(sp, tok, &sp->dropmon.sw)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_HW:
+	      if((tok = expectONOFF(sp, tok, &sp->dropmon.hw)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_LIMIT:
+	      if((tok = expectInteger32(sp, tok, &sp->dropmon.limit, 1, HSP_MAX_NOTIFY_RATELIMIT)) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_MAX:
+	      if((tok = expectInteger32(sp, tok, &sp->dropmon.max, 1, 0xFFFFFFFF)) == NULL) return NO;
+	      break;
+	    default:
+	      unexpectedToken(sp, tok, level[depth]);
+	      return NO;
+	      break;
+	    }
+	  }
+	  break;
+
 	case HSPOBJ_PCAP:
 	  {
 	    HSPPcap *pc = sp->pcap.pcaps;
@@ -1572,6 +1682,9 @@ extern "C" {
 	case HSPOBJ_TCP:
 	  {
 	    switch(tok->stok) {
+	    case HSPTOKEN_TUNNEL:
+	      if((tok = expectONOFF(sp, tok, &sp->tcp.tunnel)) == NULL) return NO;
+	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
 	      return NO;
@@ -1586,6 +1699,24 @@ extern "C" {
 	    case HSPTOKEN_SWITCHPORT:
 	      if((tok = expectRegex(sp, tok, &sp->cumulus.swp_regex)) == NULL) return NO;
 	      sp->cumulus.swp_regex_str = my_strdup(tok->str);
+	      break;
+	    default:
+	      unexpectedToken(sp, tok, level[depth]);
+	      return NO;
+	      break;
+	    }
+	  }
+	  break;
+
+	case HSPOBJ_DENT:
+	  {
+	    switch(tok->stok) {
+	    case HSPTOKEN_SWITCHPORT:
+	      if((tok = expectRegex(sp, tok, &sp->dent.swp_regex)) == NULL) return NO;
+	      sp->dent.swp_regex_str = my_strdup(tok->str);
+	      break;
+	    case HSPTOKEN_SW:
+	      if((tok = expectONOFF(sp, tok, &sp->dent.sw)) == NULL) return NO;
 	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
@@ -1651,6 +1782,24 @@ extern "C" {
 	  }
 	  break;
 
+	case HSPOBJ_SONIC:
+	  {
+	    switch(tok->stok) {
+	    case HSPTOKEN_SWITCHPORT:
+	      if((tok = expectRegex(sp, tok, &sp->sonic.swp_regex)) == NULL) return NO;
+	      sp->sonic.swp_regex_str = my_strdup(tok->str);
+	      break;
+	    case HSPTOKEN_UNIXSOCK:
+	      if((tok = expectONOFF(sp, tok, &sp->sonic.unixsock)) == NULL) return NO;
+	      break;
+	    default:
+	      unexpectedToken(sp, tok, level[depth]);
+	      return NO;
+	      break;
+	    }
+	  }
+	  break;
+
 	case HSPOBJ_PORT:
 	  {
 	    HSPPort *prt = NULL;
@@ -1707,10 +1856,13 @@ extern "C" {
 	      if((tok = expectONOFF(sp, tok, &sp->systemd.dropPriv)) == NULL) return NO;
 	      break;
 	    case HSPTOKEN_CGROUP_PROCS:
-	      if((tok = expectFormat(sp, tok, &sp->systemd.cgroup_procs)) == NULL) return NO;
+	      if((tok = expectString(sp, tok, &sp->systemd.cgroup_procs, "format")) == NULL) return NO;
 	      break;
 	    case HSPTOKEN_CGROUP_ACCT:
-	      if((tok = expectFormat(sp, tok, &sp->systemd.cgroup_acct)) == NULL) return NO;
+	      if((tok = expectString(sp, tok, &sp->systemd.cgroup_acct, "format")) == NULL) return NO;
+	      break;
+	    case HSPTOKEN_CGROUP_TRAFFIC:
+	      if((tok = expectONOFF(sp, tok, &sp->systemd.markTraffic)) == NULL) return NO;
 	      break;
 	    default:
 	      unexpectedToken(sp, tok, level[depth]);
@@ -1748,7 +1900,8 @@ extern "C" {
     else {
       if(sp->sFlowSettings_file->numCollectors == 0
 	 && sp->DNSSD.DNSSD == NO
-	 && sp->eapi.eapi == NO) {
+	 && sp->eapi.eapi == NO
+	 && sp->sonic.sonic == NO) {
 	myLog(LOG_ERR, "parse error in %s : no collectors are defined", sp->configFile);
 	parseOK = NO;
       }
@@ -1799,20 +1952,40 @@ extern "C" {
       if(tokenMatch(keyBuf, HSPTOKEN_COLLECTOR)) {
 	int valLen = my_strlen(valBuf);
 	if(valLen > 3) {
-	  uint32_t delim = strcspn(valBuf, "/");
-	  if(delim > 0 && delim < valLen) {
-	    valBuf[delim] = '\0';
-	    HSPCollector *coll = newCollector(st);
-	    if(lookupAddress(valBuf, (struct sockaddr *)&coll->sendSocketAddr,  &coll->ipAddr, 0) == NO) {
-	      myLog(LOG_ERR, "collector address lookup failed: %s", valBuf);
-	      // turn off the collector by clearing the address type
-	      coll->ipAddr.type = SFLADDRESSTYPE_UNDEFINED;
-	    }
-	    coll->udpPort = strtol(valBuf + delim + 1, NULL, 0);
-	    if(coll->udpPort < 1 || coll->udpPort > 65535) {
-	      myLog(LOG_ERR, "collector bad port: %d", coll->udpPort);
-	      // turn off the collector by clearing the address type
-	      coll->ipAddr.type = SFLADDRESSTYPE_UNDEFINED;
+	  HSPCollector *coll = newCollector(st);
+	  char partBuf[EV_MAX_EVT_DATALEN];
+	  uint32_t field = 0;
+	  char *str = valBuf;
+	  // collector=address/udpport/deviceName/namespace
+	  // This assumes we never have a '/' in one of these names.
+	  while(parseNextTok(&str, "/", YES, '"', YES, partBuf, EV_MAX_EVT_DATALEN)) {
+	    switch(field++) {
+	    case 0: // address
+	      if(lookupAddress(partBuf, (struct sockaddr *)&coll->sendSocketAddr, &coll->ipAddr, 0) == NO) {
+		myLog(LOG_ERR, "collector address lookup failed: %s", partBuf);
+		// turn off the collector by clearing the address type
+		coll->ipAddr.type = SFLADDRESSTYPE_UNDEFINED;
+	      }
+	      break;
+	    case 1: // udpport
+	      coll->udpPort = strtol(partBuf, NULL, 0);
+	      if(coll->udpPort < 1 || coll->udpPort > 65535) {
+		myLog(LOG_ERR, "collector bad port: %d", coll->udpPort);
+		// turn off the collector by clearing the address type
+		coll->ipAddr.type = SFLADDRESSTYPE_UNDEFINED;
+	      }
+	      break;
+	    case 2: // deviceName
+	      if(my_strlen(partBuf) > 0)
+		coll->deviceName = my_strdup(partBuf);
+	      break;
+	    case 3: // namespace
+	      if(my_strlen(partBuf) > 0)
+		coll->namespace = my_strdup(partBuf);
+	      break;
+	    default:
+	      myLog(LOG_ERR, "ignoring excess collector-spec fields");
+	      break;
 	    }
 	  }
 	}

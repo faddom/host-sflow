@@ -74,7 +74,7 @@ typedef struct _SFLDataSource_instance {
 #define SFL_COUNTERS_SAMPLE_TYPE SFLCounters_sample
   /* if index numbers are not going to use all 32 bits, then we can use
      the more compact encoding, with the dataSource class and index merged */
-#define SFL_DS_DATASOURCE(dsi) (((dsi).ds_class << 24) + (dsi).ds_index)
+#define SFL_DS_SOURCEID(cls,idx) ((cls) << 24) + (idx)
 #endif
 
 #define SFL_DS_INSTANCE(dsi) (dsi).ds_instance
@@ -140,6 +140,8 @@ typedef struct _SFLSampler {
   uint32_t samplesThisTick;
   uint32_t samplesLastTick;
   uint32_t backoffThreshold;
+  /* optional alias datasource index */
+  uint32_t ds_alias;
 } SFLSampler;
 
 /* declare */
@@ -165,6 +167,8 @@ typedef struct _SFLPoller {
   SFLReceiver *myReceiver;
   time_t countersCountdown;
   uint32_t countersSampleSeqNo;
+  /* optional alias datasource index */
+  uint32_t ds_alias;
 } SFLPoller;
 
 typedef void *(*allocFn_t)(void *magic,               /* callback to allocate space on heap */
@@ -186,6 +190,25 @@ typedef void (*sendFn_t)(void *magic,                 /* optional override fn to
 			 uint32_t pktLen);
 
 
+typedef struct _SFLNotifier {
+  /* for linked list */
+  struct _SFLNotifier *nxt;
+  /* MIB fields */
+  SFLDataSource_instance dsi;
+  uint32_t sFlowEsReceiver;
+  uint32_t sFlowEsMaximumHeaderSize;
+  /* public fields */
+  struct _SFLAgent *agent; /* pointer to my agent */
+  void *userData;          /* can be useful to hang something else here */
+  /* private fields */
+  SFLReceiver *myReceiver;
+  uint32_t seqNo;
+  uint32_t nLastTick;
+  uint32_t nThisTick;
+  /* optional alias datasource index */
+  uint32_t ds_alias;
+} SFLNotifier;
+
 /* prime numbers are good for hash tables */
 #define SFL_HASHTABLE_SIZ 199
 
@@ -193,6 +216,7 @@ typedef struct _SFLAgent {
   SFLSampler *jumpTable[SFL_HASHTABLE_SIZ]; /* fast lookup table for samplers (by ifIndex) */
   SFLSampler *samplers;   /* the list of samplers */
   SFLPoller  *pollers;    /* the list of samplers */
+  SFLNotifier *notifiers; /* the list of notifiers */
   SFLReceiver *receivers; /* the array of receivers */
   time_t bootTime;        /* time when we booted or started */
   time_t now;             /* time now - seconds */
@@ -231,6 +255,9 @@ SFLPoller *sfl_agent_addPoller(SFLAgent *agent,
 			       void *magic, /* ptr to pass back in getCountersFn() */
 			       getCountersFn_t getCountersFn);
 
+/* call this to create notifiers */
+SFLNotifier *sfl_agent_addNotifier(SFLAgent *agent, SFLDataSource_instance *pdsi);
+
 /* call this to create receivers */
 SFLReceiver *sfl_agent_addReceiver(SFLAgent *agent);
 
@@ -240,14 +267,19 @@ int sfl_agent_removeSampler(SFLAgent *agent, SFLDataSource_instance *pdsi);
 /* call this to remove pollers */
 int sfl_agent_removePoller(SFLAgent *agent, SFLDataSource_instance *pdsi);
 
+/* call this to remove nofifiers */
+int sfl_agent_removeNotifier(SFLAgent *agent, SFLDataSource_instance *pdsi);
+
 /* note: receivers should not be removed. Typically the receivers
    list will be created at init time and never changed */
 
-/* call these fns to retrieve sampler, poller or receiver (e.g. for SNMP GET or GETNEXT operation) */
+/* call these fns to retrieve sampler, poller, notifier or receiver (e.g. for SNMP GET or GETNEXT operation) */
 SFLSampler  *sfl_agent_getSampler(SFLAgent *agent, SFLDataSource_instance *pdsi);
 SFLSampler  *sfl_agent_getNextSampler(SFLAgent *agent, SFLDataSource_instance *pdsi);
 SFLPoller   *sfl_agent_getPoller(SFLAgent *agent, SFLDataSource_instance *pdsi);
 SFLPoller   *sfl_agent_getNextPoller(SFLAgent *agent, SFLDataSource_instance *pdsi);
+SFLNotifier *sfl_agent_getNotifier(SFLAgent *agent, SFLDataSource_instance *pdsi);
+SFLNotifier  *sfl_agent_getNextNotifier(SFLAgent *agent, SFLDataSource_instance *pdsi);
 SFLReceiver *sfl_agent_getReceiver(SFLAgent *agent, uint32_t receiverIndex);
 SFLReceiver *sfl_agent_getNextReceiver(SFLAgent *agent, uint32_t receiverIndex);
 
@@ -284,6 +316,12 @@ void     sfl_poller_set_sFlowCpReceiver(SFLPoller *poller, uint32_t sFlowCpRecei
 uint32_t sfl_poller_get_sFlowCpInterval(SFLPoller *poller);
 void     sfl_poller_set_sFlowCpInterval(SFLPoller *poller, uint32_t sFlowCpInterval);
 void     sfl_poller_synchronize_polling(SFLPoller *poller, SFLPoller *master);
+/* notifier */
+uint32_t sfl_notifier_get_sFlowEsReceiver(SFLNotifier *notifier);
+void sfl_notifier_set_sFlowEsReceiver(SFLNotifier *notifier, uint32_t sFlowEsReceiver);
+uint32_t sfl_notifier_get_sFlowEsMaximumHeaderSize(SFLNotifier *notifier);
+void sfl_notifier_set_sFlowEsMaximumHeaderSize(SFLNotifier *notifier, uint32_t sFlowEsMaximumHeaderSize);
+uint32_t sfl_notifier_get_nLastTick(SFLNotifier *notifier);
 
 /* call this to indicate a discontinuity with a counter like samplePool so that the
    sflow collector will ignore the next delta */
@@ -292,6 +330,9 @@ void sfl_sampler_resetFlowSeqNo(SFLSampler *sampler);
 /* call this to indicate a discontinuity with one or more of the counters so that the
    sflow collector will ignore the next delta */
 void sfl_poller_resetCountersSeqNo(SFLPoller *poller);
+
+/* call this to indicate a discontinuity with the stream of notifications */
+void sfl_notifier_resetSeqNo(SFLNotifier *notifier);
   
 /* software sampling: call this with every packet - returns non-zero if the packet
    should be sampled (in which case you then call sfl_sampler_writeFlowSample()) */
@@ -312,6 +353,11 @@ void sfl_agent_set_now(SFLAgent *agent, time_t now_S, time_t now_nS);
 /* call this to change the designated sflow-agent-address */  
 void sfl_agent_set_address(SFLAgent *agent, SFLAddress *ip);
 
+/* use this to remap datasource index numbers on export */
+void sfl_sampler_set_dsAlias(SFLSampler *sampler, uint32_t ds_alias);
+void sfl_poller_set_dsAlias(SFLPoller *poller, uint32_t ds_alias);
+void sfl_notifier_set_dsAlias(SFLNotifier *notifier, uint32_t ds_alias);
+
 /* convert stored "now" to mS since bootTime */
 uint32_t sfl_agent_uptime_mS(SFLAgent *agent);
 
@@ -320,6 +366,9 @@ void sfl_sampler_writeFlowSample(SFLSampler *sampler, SFL_FLOW_SAMPLE_TYPE *fs);
 
 /* call this to push counters samples (usually done in the getCountersFn callback) */
 void sfl_poller_writeCountersSample(SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs);
+
+/* call this to send a notification */
+void sfl_notifier_writeEventSample(SFLNotifier *notifier, SFLEvent_discarded_packet *es);
 
 /* call this to deallocate resources */
 void sfl_agent_release(SFLAgent *agent);
@@ -330,14 +379,17 @@ void sfl_agent_release(SFLAgent *agent);
 void sfl_receiver_init(SFLReceiver *receiver, SFLAgent *agent);
 void sfl_sampler_init(SFLSampler *sampler, SFLAgent *agent, SFLDataSource_instance *pdsi);
 void sfl_poller_init(SFLPoller *poller, SFLAgent *agent, SFLDataSource_instance *pdsi, void *magic, getCountersFn_t getCountersFn);
+void sfl_notifier_init(SFLNotifier *notifier, SFLAgent *agent, SFLDataSource_instance *pdsi);
 
 
 void sfl_receiver_tick(SFLReceiver *receiver, time_t now);
 void sfl_poller_tick(SFLPoller *poller, time_t now);
 void sfl_sampler_tick(SFLSampler *sampler, time_t now);
+void sfl_notifier_tick(SFLNotifier *notifier, time_t now);
 
 int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs);
 int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_TYPE *cs);
+int sfl_receiver_writeEventSample(SFLReceiver *receiver, SFLEvent_discarded_packet *es);
 int sfl_receiver_writeEncoded(SFLReceiver *receiver, uint32_t samples, uint32_t *data, int packedSize);
 void sfl_receiver_flush(SFLReceiver *receiver);
 

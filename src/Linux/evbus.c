@@ -140,14 +140,15 @@ extern "C" {
     return sock;
   }
 
-  bool EVSocketClose(EVMod *mod, EVSocket *sock) {
+  bool EVSocketClose(EVMod *mod, EVSocket *sock, bool closeFD) {
     EVSocket *deleted;
     SEMLOCK_DO(mod->root->sync) {
       EVSocket search = { .fd = sock->fd };
       deleted = UTHashDelKey(mod->root->sockets, &search);
       assert(deleted == sock);
       if(sock->fd > 0) {
-	while(close(sock->fd) == -1 && errno == EINTR);
+	if(closeFD)
+	  while(close(sock->fd) == -1 && errno == EINTR);
 	sock->fd = 0;
       }
       if(sock->child_pid) {
@@ -209,7 +210,8 @@ extern "C" {
 	myDebug(1, "dlopen(%s) failed : %s", path, dlerror());
       }
     }
-    else {
+    if(mod->libHandle == NULL) {
+      // try internal load, in case .o was included in executable
       if((mod->libHandle = dlopen(NULL, RTLD_NOW)) == NULL) {
 	myDebug(1, "dlopen(NULL) failed : %s", dlerror());
       }
@@ -447,6 +449,19 @@ extern "C" {
     return (secs * 1000) + (nanos / 1000000);
   }
 
+  void EVTimeAdd_nS(struct timespec *t, int nS) {
+    assert(nS <= 1000000000);
+    t->tv_nsec += nS;
+    if(t->tv_nsec > 1000000000) {
+      t->tv_sec++;
+      t->tv_nsec -= 1000000000;
+    }
+    else if(t->tv_nsec < 0) {
+      t->tv_sec--;
+      t->tv_nsec += 1000000000;
+    }
+  }
+
   static void *busRun(void *magic) {
     EVBus *bus = (EVBus *)magic;
     EVMod *mod = bus->root->rootModule;
@@ -473,16 +488,13 @@ extern "C" {
       busRead(bus);
 
       // Detect tick/deci boundaries.
-      // These tick/tock/deci events can skip if something
-      // blocks for too long in this thread,  so it's advisable
-      // to implement timeouts by comparing with a target time.
-      // We can do that more safely now that we are using a
-      // monotonic clock.
-      if(EVTimeDiff_nS(&bus->now_deci, &bus->now) > 100000000) {
-	bus->now_deci = bus->now;
+      // These tick/tock/deci events used to skip if something
+      // blocked for too long in this thread, but not any longer.
+      while(EVTimeDiff_nS(&bus->now_deci, &bus->now) > 100000000) {
+	EVTimeAdd_nS(&bus->now_deci, 100000000);
 	EVEventTx(mod, deci, NULL, 0);
-	if(EVTimeDiff_nS(&bus->now_tick, &bus->now) > 1000000000) {
-	  bus->now_tick = bus->now;
+	if(EVTimeDiff_nS(&bus->now_tick, &bus->now_deci) > 1000000000) {
+	  EVTimeAdd_nS(&bus->now_tick, 1000000000);
 	  EVEventTx(mod, tick, NULL, 0);
 	  EVEventTx(mod, tock, NULL, 0);
 	}
@@ -560,12 +572,12 @@ extern "C" {
     if(cc < 0) {
       if(errno == EAGAIN || errno == EINTR) goto try_again;
       myLog(LOG_ERR, "EVSocketReadLines(): %s", strerror(errno));
-      EVSocketClose(mod, sock);
+      EVSocketClose(mod, sock, YES);
       (*lineCB)(mod, sock, EVSOCKETREAD_ERR, magic);
     }
     else if(cc == 0) {
       // EOF
-      EVSocketClose(mod, sock);
+      EVSocketClose(mod, sock, YES);
       // may have trailing line
       if(UTSTRBUF_LEN(sock->iobuf)) {
 	UTStrBuf_append_n(sock->ioline, UTSTRBUF_STR(sock->iobuf), UTSTRBUF_LEN(sock->iobuf));
