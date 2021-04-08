@@ -690,6 +690,7 @@ static int computeFlowSampleElementsSize(SFLReceiver *receiver, SFLFlow_sample_e
     case SFLFLOW_EX_FUNCTION:  elemSiz = stringEncodingLength(&elem->flowType.function.symbol); break;
     case SFLFLOW_EX_TRANSIT: elemSiz = XDRSIZ_SFLEXTENDED_TRANSIT; break;
     case SFLFLOW_EX_Q_DEPTH: elemSiz = XDRSIZ_SFLEXTENDED_Q_DEPTH; break;
+	case SFLCOUNTERS_VNT_HYPERV: break;
     default:
       sflError(receiver, "unexpected packet_data_tag");
       return -1;
@@ -799,6 +800,7 @@ static int sfl_receiver_writeFlowSampleElements(SFLReceiver *receiver, SFLFlow_s
     case SFLFLOW_EX_FUNCTION: putString(receiver, &elem->flowType.function.symbol); break;
     case SFLFLOW_EX_TRANSIT: putNet32(receiver, elem->flowType.transit_delay.delay); break;
     case SFLFLOW_EX_Q_DEPTH: putNet32(receiver, elem->flowType.queue_depth.depth); break;
+	case SFLCOUNTERS_VNT_HYPERV: break;
     default:
       sflError(receiver, "unexpected packet_data_tag");
       return -1;
@@ -1019,6 +1021,7 @@ static int computeCountersSampleSize(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
     case SFLCOUNTERS_APP_WORKERS:  elemSiz = appWorkersEncodingLength(&elem->counterBlock.appWorkers); break;
     case SFLCOUNTERS_PORTNAME:  elemSiz = stringEncodingLength(&elem->counterBlock.portName.portName); break;
     case SFLCOUNTERS_BCM_TABLES: elemSiz = XDRSIZ_BCM_TABLES;  break;
+	case SFLCOUNTERS_VNT_HYPERV: elemSiz = 0; break;
     default:
       {
 	char errm[128];
@@ -1315,6 +1318,8 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
     case SFLCOUNTERS_BCM_TABLES:
       putNet32_run(receiver, &elem->counterBlock.bcm_tables, XDRSIZ_BCM_TABLES / 4);
       break;
+	case SFLCOUNTERS_VNT_HYPERV:
+		break;
 
     default:
       {
