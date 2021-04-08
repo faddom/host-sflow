@@ -81,11 +81,18 @@ extern "C" {
     linkedlist = obj; \
   } while(0)
 
+#define PROCFS_STR STRINGIFY_DEF(PROCFS)
+#define SYSFS_STR STRINGIFY_DEF(SYSFS)
+#define ETCFS_STR STRINGIFY_DEF(ETCFS)
+#define VARFS_STR STRINGIFY_DEF(VARFS)
+
 #define HSP_DAEMON_NAME "hsflowd"
-#define HSP_DEFAULT_PIDFILE "/var/run/hsflowd.pid"
-#define HSP_DEFAULT_CONFIGFILE "/etc/hsflowd.conf"
-#define HSP_DEFAULT_OUTPUTFILE "/etc/hsflowd.auto"
+#define HSP_DEFAULT_PIDFILE VARFS_STR "/run/hsflowd.pid"
+#define HSP_DEFAULT_CONFIGFILE ETCFS_STR "/hsflowd.conf"
+#define HSP_DEFAULT_OUTPUTFILE ETCFS_STR "/hsflowd.auto"
 #ifndef HSP_MOD_DIR
+  // this one does not use ETC_FS, since the modules
+  // are always installed at this path
 #define HSP_MOD_DIR /etc/hsflowd/modules
 #endif
 
@@ -101,6 +108,9 @@ extern "C" {
 #define HSP_FORGET_VMS 180
 #define HSP_REFRESH_ADAPTORS 180
 #define HSP_CHECK_ADAPTORS 10
+#define HSP_RETRY_COLLECTOR_SOCKET 7
+
+#define HSP_MAX_PATHLEN 256
 
 // set to 1 to allow agent.cidr setting in DNSSD TXT record.
 // This is currently considered out-of-scope for the DNSSD config,
@@ -215,6 +225,15 @@ extern "C" {
     VMTYPE_DOCKER,
     VMTYPE_SYSTEMD } EnumVMType;
 
+  typedef struct _HSPGpuID {
+    char uuid[16];
+    uint32_t index;
+    uint32_t minor;
+    uint8_t has_index:1;
+    uint8_t has_uuid:1;
+    uint8_t has_minor:1;
+  } HSPGpuID;
+
   typedef struct _HSPVMState {
     char uuid[16];
     EnumVMType vmType;
@@ -224,6 +243,7 @@ extern "C" {
     SFLAdaptorList *interfaces;
     UTStringArray *volumes;
     UTStringArray *disks;
+    UTArray *gpus;
     SFLPoller *poller;
   } HSPVMState;
 
@@ -236,9 +256,17 @@ extern "C" {
 		 IPSP_VLAN4,
 		 IPSP_IP6_SCOPE_UNIQUE,
 		 IPSP_IP6_SCOPE_GLOBAL,
+		 IPSP_IP4_RFC1918,
 		 IPSP_IP4,
 		 IPSP_NUM_PRIORITIES,
   } EnumIPSelectionPriority;
+
+  typedef struct _HSPLocalIP {
+    SFLAddress ipAddr;
+    char *dev;
+    EnumIPSelectionPriority ipPriority;
+    uint32_t discoveryIndex;
+  } HSPLocalIP;
 
   typedef struct _HSP_ethtool_counters {
     uint64_t mcasts_in;
@@ -269,7 +297,8 @@ extern "C" {
   // cache nio counters per adaptor
   typedef struct _HSPAdaptorNIO {
     SFLAddress ipAddr;
-    uint32_t /*EnumIPSelectionPriority*/ ipPriority;
+    UTHash *ip4Addrs;
+    UTHash *ip6Addrs;
     EnumHSPDevType devType;
     bool up:1;
     bool loopback:1;
@@ -329,6 +358,8 @@ extern "C" {
     uint32_t sampling_n;
     uint32_t sampling_n_set;
     uint32_t netlink_drops;
+    // allow psample to apply subsampling if n is unexpected
+    uint32_t subSampleCount;
     // allow mod_xen to write regex-extracted fields here
     int xen_domid;
     int xen_netid;
@@ -345,10 +376,12 @@ extern "C" {
 
 #define HSPBUS_POLL "poll" // main thread
 #define HSPBUS_CONFIG "config" // DNS-SD
-#define HSPBUS_PACKET "packet" // pcap,ulog,nflog,json,tcp packet processing
+#define HSPBUS_PACKET "packet" // pcap,ulog,nflog,json,tcp,psample packet processing
 
 // The generic start,tick,tock,final,end events are defined in evbus.h
 #define HSPEVENT_HOST_COUNTER_SAMPLE "csample"   // (csample *) building counter-sample
+#define HSPEVENT_INTF_COUNTER_SAMPLE "icsample"  // (csample *) building intf counter-sample
+#define HSPEVENT_VM_COUNTER_SAMPLE "vcsample"    // (csample *) building vm counter-sample
 #define HSPEVENT_FLOW_SAMPLE "flow_sample"       // (HSPPendingSample *) building flow-sample
 #define HSPEVENT_CONFIG_START "config_start"     // begin config lines
 #define HSPEVENT_CONFIG_LINE "config_line"       // (line)...next config line
@@ -367,7 +400,29 @@ extern "C" {
     SFLSampler *sampler;
     int refCount;
     UTArray *ptrsToFree;
+    // header decode
+    int ipversion;
+    uint8_t *hdr;
+    int hdr_len;
+    enum SFLHeader_protocol hdr_protocol;    
+    SFLAddress src;
+    SFLAddress dst;
+    int l3_offset;
+    int l4_offset;
+    uint8_t ipproto;
+    bool decoded:1;
+    // local address test
+    bool localTest:1;
+    bool localSrc:1;
+    bool localDst:1;
+    bool suppress:1;
   } HSPPendingSample;
+
+  typedef struct _HSPPendingCSample {
+    SFL_COUNTERS_SAMPLE_TYPE *cs;
+    SFLPoller *poller;
+    bool suppress:1;
+  } HSPPendingCSample;
 
   typedef enum {
     HSP_TELEMETRY_FLOW_SAMPLES=0,
@@ -376,6 +431,9 @@ extern "C" {
     HSP_TELEMETRY_RTFLOW_SAMPLES,
     HSP_TELEMETRY_DATAGRAMS,
     HSP_TELEMETRY_DROPPED_SAMPLES,
+    HSP_TELEMETRY_FLOW_SAMPLES_SUPPRESSED,
+    HSP_TELEMETRY_COUNTER_SAMPLES_SUPPRESSED,
+    HSP_TELEMETRY_EVENT_SAMPLES,
     HSP_TELEMETRY_NUM_COUNTERS
   } EnumHSPTelemetry;
 
@@ -386,7 +444,10 @@ extern "C" {
     "rtmetric_samples",
     "rtflow_samples",
     "datagrams",
-    "dropped_samples"
+    "dropped_samples",
+    "flow_samples_suppressed",
+    "counter_samples_suppressed"
+    "event_samples",
   };
 #endif
 
@@ -411,10 +472,14 @@ extern "C" {
     bool counterSampleQueued;
 
     // config settings
+    void *config_tokens;
     HSPSFlowSettings *sFlowSettings_file;
     HSPSFlowSettings *sFlowSettings_dyn;
     HSPSFlowSettings *sFlowSettings;
     char *sFlowSettings_str;
+
+    // collector socket failure recovery
+    uint32_t reopenCollectorSocketCountdown;
 
     // resolve actual polling interval
     uint32_t syncPollingInterval;
@@ -456,12 +521,20 @@ extern "C" {
       bool docker;
       uint32_t refreshVMListSecs;
       uint32_t forgetVMSecs;
+      bool hostname;
+      bool markTraffic; // TODO: use enum here?
     } docker;
     struct {
       bool cumulus;
       char *swp_regex_str;
       regex_t *swp_regex;
     } cumulus;
+    struct {
+      bool dent;
+      char *swp_regex_str;
+      regex_t *swp_regex;
+      bool sw;
+    } dent;
     struct {
       bool ovs;
     } ovs;
@@ -473,6 +546,12 @@ extern "C" {
       HSPPort *ports; // alternative way to list switch ports
       uint32_t numPorts;
     } opx;
+    struct {
+      bool sonic;
+      char *swp_regex_str;
+      regex_t *swp_regex;
+      bool unixsock;
+    } sonic;
     struct {
       bool nvml;
     } nvml;
@@ -491,12 +570,29 @@ extern "C" {
       uint32_t ds_options;
     } nflog;
     struct {
+      bool psample;
+      uint32_t group;
+      uint32_t ds_options;
+      bool ingress;
+      bool egress;
+    } psample;
+    struct {
+      bool dropmon;
+      uint32_t group;
+      bool start;
+      bool sw;
+      bool hw;
+      uint32_t limit;
+      uint32_t max;
+    } dropmon;
+    struct {
       bool pcap;
       HSPPcap *pcaps;
       uint32_t numPcaps;
     } pcap;
     struct {
       bool tcp;
+      bool tunnel;
     } tcp;
     struct {
       bool dbus;
@@ -507,6 +603,7 @@ extern "C" {
       bool dropPriv;
       char *cgroup_procs;
       char *cgroup_acct;
+      bool markTraffic;
     } systemd;
     struct {
       bool eapi;
@@ -520,7 +617,6 @@ extern "C" {
     bool configOK;
     char *outputFile;
     char *pidFile;
-    bool daemonize;
     bool dropPriv;
     uint32_t outputRevisionNo;
     FILE *f_out;
@@ -540,6 +636,7 @@ extern "C" {
     UTHash *adaptorsByIndex;
     UTHash *adaptorsByPeerIndex;
     UTHash *adaptorsByMac;
+    bool allowDeleteAdaptor;
 
     // poll actions for tick-tock cycle
     UTArray *pollActions;
@@ -562,6 +659,8 @@ extern "C" {
     bool refreshAdaptorList; // request flag
     uint32_t refreshAdaptorListSecs; // poll interval
     time_t next_refreshAdaptorList; // deadline
+
+    bool suppress_sendPkt;
 
     uint32_t checkAdaptorListSecs; // poll interval
     time_t next_checkAdaptorList; // deadline
@@ -616,6 +715,7 @@ extern "C" {
   // read functions
   bool detectInterfaceChange(HSP *sp);
   int readInterfaces(HSP *sp, bool full_discovery, uint32_t *p_added, uint32_t *p_removed, uint32_t *p_cameup, uint32_t *p_wentdown, uint32_t *p_changed);
+  bool isLocalAddress(HSP *sp, SFLAddress *addr);
   const char *devTypeName(EnumHSPDevType devType);
   int readCpuCounters(SFLHost_cpu_counters *cpu);
   int readMemoryCounters(SFLHost_mem_counters *mem);
@@ -646,7 +746,7 @@ extern "C" {
   // adaptors
   SFLAdaptor *nioAdaptorNew(char *dev, u_char *macBytes, uint32_t ifIndex);
 #define ADAPTOR_NIO(ad) ((HSPAdaptorNIO *)(ad)->userData)
-  void adaptorAddOrReplace(UTHash *ht, SFLAdaptor *ad);
+  void adaptorAddOrReplace(UTHash *ht, SFLAdaptor *ad, char *htname);
   SFLAdaptor *adaptorByName(HSP *sp, char *dev);
   SFLAdaptor *adaptorByMac(HSP *sp, SFLMacAddress *mac);
   SFLAdaptor *adaptorByIndex(HSP *sp, uint32_t ifIndex);
@@ -658,6 +758,10 @@ extern "C" {
   char *adaptorStr(SFLAdaptor *ad, char *buf, int bufLen);
   void adaptorHTPrint(UTHash *ht, char *prefix);
   void setAdaptorSpeed(HSP *sp, SFLAdaptor *adaptor, uint64_t speed, char *method);
+
+  // local IPs
+  HSPLocalIP *localIPNew(SFLAddress *ipAddr, char *dev);
+  void localIPFree(HSPLocalIP *lip);
 
   // readPackets.c
 #define HSP_SAMPLEOPT_BRIDGE      0x0001
@@ -672,13 +776,15 @@ extern "C" {
 #define HSP_SAMPLEOPT_INGRESS     0x0400
 #define HSP_SAMPLEOPT_EGRESS      0x0800
 #define HSP_SAMPLEOPT_DIRN_HOOK   0x1000
-#define HSP_SAMPLEOPT_ASIC        0x2000
+  //#define HSP_SAMPLEOPT_ASIC        0x2000
 #define HSP_SAMPLEOPT_OPX         0x4000
+#define HSP_SAMPLEOPT_PSAMPLE     0x8000
 
-  void takeSample(HSP *sp, SFLAdaptor *ad_in, SFLAdaptor *ad_out, SFLAdaptor *ad_tap, uint32_t options, uint32_t hook, const u_char *mac_hdr, uint32_t mac_len, const u_char *cap_hdr, uint32_t cap_len, uint32_t pkt_len, uint32_t drops, uint32_t sampling_n);
+  void takeSample(HSP *sp, SFLAdaptor *ad_in, SFLAdaptor *ad_out, SFLAdaptor *ad_tap, uint32_t options, uint32_t hook, const u_char *mac_hdr, uint32_t mac_len, const u_char *cap_hdr, uint32_t cap_len, uint32_t pkt_len, uint32_t drops, uint32_t sampling_n, SFLFlow_sample_element *extended_elements);
   void *pendingSample_calloc(HSPPendingSample *ps, size_t len);
   void holdPendingSample(HSPPendingSample *ps);
   void releasePendingSample(HSP *sp, HSPPendingSample *ps);
+  int decodePendingSample(HSPPendingSample *ps);
   SFLPoller *forceCounterPolling(HSP *sp, SFLAdaptor *adaptor);
 
   // VM lifecycle

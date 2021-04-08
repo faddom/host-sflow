@@ -13,6 +13,7 @@ ifndef REDHAT
   REDHAT=$(shell if [ -r /etc/redhat-release ]; then echo "yes"; else echo "no"; fi)
 endif
 
+HSFLOWD_CONF=scripts/hsflowd.conf
 HSFLOWD_INITSCRIPT=scripts/hsflowd
 HSFLOWD_SYSTEMD_SERVICE=scripts/hsflowd.service
 HSFLOWD_DBUS_CONF=scripts/net.sflow.hsflowd.conf
@@ -27,11 +28,13 @@ endif
 INSTALL=install
 
 #########  object files  #########
-FEATURES_ALL= ULOG NFLOG PCAP TCP DOCKER KVM XEN NVML OVS CUMULUS OS10 OPX DBUS SYSTEMD EAPI
-FEATURES_CUMULUS= CUMULUS NFLOG SYSTEMD
+FEATURES_ALL= ULOG NFLOG PSAMPLE DROPMON PCAP TCP DOCKER KVM XEN NVML OVS CUMULUS DENT OS10 OPX SONIC DBUS SYSTEMD EAPI
+FEATURES_CUMULUS= CUMULUS NFLOG PSAMPLE SYSTEMD DROPMON
+FEATURES_DENT= DENT PSAMPLE SYSTEMD DROPMON
 FEATURES_EOS= EAPI
 FEATURES_OS10= OS10 DBUS SYSTEMD
 FEATURES_OPX= OPX DBUS SYSTEMD
+FEATURES_SONIC= SONIC PSAMPLE DOCKER
 FEATURES_XEN= XEN OVS
 FEATURES_HOST= NFLOG PCAP TCP DOCKER KVM OVS DBUS SYSTEMD
 
@@ -52,6 +55,14 @@ endif
 ifeq ("$(strip $(FEATURES))","CUMULUS")
   XTGTS += $(FEATURES_CUMULUS)
   CFLAGS_LOAD += -DHSP_LOAD_CUMULUS
+  HSFLOWD_CONF=scripts/hsflowd.conf.cumulus
+  HSFLOWD_SYSTEMD_SERVICE=scripts/hsflowd.service.cumulus
+endif
+ifeq ("$(strip $(FEATURES))","DENT")
+  XTGTS += $(FEATURES_DENT)
+  CFLAGS_LOAD += -DHSP_LOAD_DENT
+  HSFLOWD_CONF=scripts/hsflowd.conf.dent
+  HSFLOWD_SYSTEMD_SERVICE=scripts/hsflowd.service.dent
 endif
 ifeq ("$(strip $(FEATURES))","EOS")
   XTGTS += $(FEATURES_EOS)
@@ -67,6 +78,14 @@ ifeq ("$(strip $(FEATURES))","OPX")
   CFLAGS_LOAD += -DHSP_LOAD_OPX
   HSFLOWD_SYSTEMD_SERVICE=scripts/hsflowd.service.opx
 endif
+ifeq ("$(strip $(FEATURES))","SONIC")
+  XTGTS += $(FEATURES_SONIC)
+  CFLAGS_LOAD += -DHSP_LOAD_SONIC
+  HSFLOWD_CONF=scripts/hsflowd.conf.sonic
+  # hsflowd runs as container with --net=host and some host-fs mountpoints. Expect something like:
+  # make deb FEATURES=SONIC PROCFS=/rootfs/proc SYSFS=/rootfs/sys VARFS=/rootfs/var ETCFS=/tmp/etc
+  # so that docker run command can expose host directories selectively
+endif
 ifeq ("$(strip $(FEATURES))","XEN")
   XTGTS += $(FEATURES_XEN)
   CFLAGS_LOAD += -DHSP_LOAD_XEN
@@ -76,6 +95,24 @@ ifeq ("$(strip $(FEATURES))","HOST")
 endif
 
 $(info $$XTGTS is [$(XTGTS)])
+
+# alternative mount points (to support hsflowd running in container
+# and/or with no root privileges)
+
+ifndef PROCFS
+  PROCFS=/proc
+endif
+ifndef SYSFS
+  SYSFS=/sys
+endif
+ifndef ETCFS
+  ETCFS=/etc
+endif
+ifndef VARFS
+  VARFS=/var
+endif
+
+CFLAGS_MOUNTPOINTS=-DPROCFS=$(PROCFS) -DSYSFS=$(SYSFS) -DETCFS=$(ETCFS) -DVARFS=$(VARFS)
 
 # INSTROOT may be passed in
 BIN_D=$(BINDIR)
@@ -95,12 +132,13 @@ endif
 
 #########  compilation flags  #########
 
-HEADERS= util.h util_dbus.h evbus.h hsflowd.h hsflowtokens.h hsflow_ethtool.h cpu_utils.h Makefile
+HEADERS= util.h util_dbus.h util_netlink.h evbus.h hsflowd.h hsflowtokens.h hsflow_ethtool.h cpu_utils.h dropPoints_sw.h dropPoints_hw.h Makefile
 
 # compiler
 #CC= g++
 CC= gcc -std=gnu99
-LD=ld
+#LD=ld
+LD=gcc
 
 # optimization
 OPT_ALL= -O3 -DNDEBUG
@@ -136,7 +174,7 @@ CFLAGS_KVM= -I/usr/include/libvirt -I/usr/include/libxml2
 LIBS_KVM= -lvirt -lxml2
 
 CFLAGS_DOCKER=
-LIBS_DOCKER=
+LIBS_DOCKER= -lm
 
 CFLAGS_ULOG=
 LIBS_ULOG=
@@ -144,17 +182,27 @@ LIBS_ULOG=
 CFLAGS_NFLOG= -I/usr/include/libnfnetlink
 LIBS_NFLOG= -lnfnetlink
 
+CFLAGS_PSAMPLE=
+LIBS_PSAMPLE=
+
+CFLAGS_DROPMON=
+LIBS_DROPMON=
+
 CFLAGS_PCAP=
 LIBS_PCAP=-lpcap
 
-CFLAGS_TCP=
+CFLAGS_TCP= -DHSP_INET_DIAG_USE_DUMP_UDP
 LIBS_TCP=
 
-CFLAGS_NVML= -I/usr/include/nvidia/gdk
-LIBS_NVML= -lnvidia-ml
+CFLAGS_NVML ?= -I/usr/local/cuda/include/
+LIBDIR_NVML ?= /usr/local/cuda/lib64/stubs/
+LIBS_NVML= -L$(LIBDIR_NVML) -lnvidia-ml
 
 CFLAGS_CUMULUS=
 LIBS_CUMULUS=
+
+CFLAGS_DENT=
+LIBS_DENT=
 
 CFLAGS_OVS=
 LIBS_OVS=
@@ -167,8 +215,17 @@ ifeq ("$(strip $(FEATURES))","OS10")
   LIBS_OPX= -lsystemd -lcps-api-common -lcps-class-map-util
 endif
 
+CFLAGS_SONIC=
+LIBS_SONIC=-lhiredis
+ifeq ($(REDISONLY),yes)
+  CFLAGS_SONIC += -DHSP_SONIC_TEST_REDISONLY
+endif
+
 CFLAGS_DBUS=$(shell pkg-config dbus-1 --cflags)
 LIBS_DBUS=$(shell pkg-config dbus-1 --libs)
+
+CFLAGS_NETLINK=
+LIBS_NETLINK=
 
 CFLAGS_SYSTEMD=$(CFLAGS_DBUS)
 LIBS_SYSTEMD=$(LIBS_DBUS) -lcrypto
@@ -178,6 +235,7 @@ LIBS_EAPI=
 
 # common CFLAGS and LIBS	
 CFLAGS = $(CFLAGS_HSFLOWD) $(CFLAGS_LOAD) $(CFLAGS_SHARED) $(OPT) -D_GNU_SOURCE -DHSP_VERSION=$(VERSION)
+CFLAGS += $(CFLAGS_MOUNTPOINTS)
 CFLAGS += -DUTHEAP
 CFLAGS += -DHSP_OPTICAL_STATS
 CFLAGS += -DHSP_MOD_DIR=$(MODDIR)
@@ -216,22 +274,25 @@ OBJS_KVM=mod_kvm.o
 OBJS_DOCKER=mod_docker.o
 OBJS_ULOG=mod_ulog.o
 OBJS_NFLOG=mod_nflog.o
+OBJS_PSAMPLE=mod_psample.o util_netlink.o
+OBJS_DROPMON=mod_dropmon.o util_netlink.o
 OBJS_PCAP=mod_pcap.o
-OBJS_TCP=mod_tcp.o
+OBJS_TCP=mod_tcp.o util_netlink.o
 OBJS_NVML=mod_nvml.o
 OBJS_OVS=mod_ovs.o
 OBJS_CUMULUS=mod_cumulus.o
+OBJS_DENT=mod_dent.o
 OBJS_OPX=mod_opx.o
+OBJS_SONIC=mod_sonic.o
 OBJS_DBUS=mod_dbus.o util_dbus.o
-OBJS_SYSTEMD=mod_systemd.o util_dbus.o
+OBJS_SYSTEMD=mod_systemd.o util_dbus.o util_netlink.o
 OBJS_EAPI=mod_eapi.o
 
-BUILDTGTS=hsflowd \
-          mod_json.so \
-          mod_dnssd.so \
-          $(XTGTS)
+BUILDTGTS= mod_json.so \
+           mod_dnssd.so \
+           $(XTGTS)
 
-all: $(BUILDTGTS)
+all: $(BUILDTGTS) hsflowd
 
 #########  feature dependencies #########
 
@@ -251,6 +312,10 @@ ULOG: mod_ulog.so
 
 NFLOG: mod_nflog.so
 
+PSAMPLE: mod_psample.so
+
+DROPMON: mod_dropmon.so
+
 PCAP: mod_pcap.so
 
 TCP: mod_tcp.so
@@ -261,9 +326,13 @@ OVS: mod_ovs.so
 
 CUMULUS: mod_cumulus.so
 
+DENT: mod_dent.so
+
 OS10: mod_opx.so
 
 OPX: mod_opx.so
+
+SONIC: mod_sonic.so
 
 DBUS: mod_dbus.so
 
@@ -280,6 +349,11 @@ hsflowd: $(OBJS_HSFLOWD) $(HEADERS)
 
 util_dbus.o: util_dbus.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_DBUS)
+
+######## Netlink utils ##########
+
+util_netlink.o: util_netlink.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_NETLINK)
 
 #########  modules  #########
 
@@ -317,6 +391,23 @@ mod_nflog.so: $(OBJS_NFLOG)
 
 #----------------------------
 
+
+mod_psample.o: mod_psample.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c  $(CFLAGS_PSAMPLE)
+
+mod_psample.so: $(OBJS_PSAMPLE)
+	$(LD) -o $@ $(OBJS_PSAMPLE) $(LDFLAGS_SHARED) $(LIBS_PSAMPLE)
+
+#----------------------------
+
+
+mod_dropmon.o: mod_dropmon.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c  $(CFLAGS_DROPMON)
+
+mod_dropmon.so: $(OBJS_DROPMON)
+	$(LD) -o $@ $(OBJS_DROPMON) $(LDFLAGS_SHARED) $(LIBS_DROPMON)
+
+#----------------------------
 
 mod_pcap.o: mod_pcap.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_PCAP)
@@ -388,11 +479,27 @@ mod_cumulus.so: $(OBJS_CUMULUS)
 
 #----------------------------
 
+mod_dent.o: mod_dent.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_DENT)
+
+mod_dent.so: $(OBJS_DENT)
+	$(LD) -o $@ $(OBJS_DENT) $(LDFLAGS_SHARED) $(LIBS_DENT)
+
+#----------------------------
+
 mod_opx.o: mod_opx.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_OPX)
 
 mod_opx.so: $(OBJS_OPX)
 	$(LD) -o $@ $(OBJS_OPX) $(LDFLAGS_SHARED) $(LIBS_OPX)
+
+#----------------------------
+
+mod_sonic.o: mod_sonic.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $*.c $(CFLAGS_SONIC)
+
+mod_sonic.so: $(OBJS_SONIC)
+	$(LD) -o $@ $(OBJS_SONIC) $(LDFLAGS_SHARED) $(LIBS_SONIC)
 
 #----------------------------
 
@@ -423,19 +530,21 @@ mod_eapi.so: $(OBJS_EAPI)
 
 #########  install  #########
 
-install:
+install: all
 	$(INSTALL) -d $(BIN_D)
 	$(INSTALL) -m 700 hsflowd $(BIN_D)
 	$(INSTALL) -d $(CONF_D)
-	$(INSTALL) -m 644 scripts/hsflowd.conf $(CONF_D)
+	$(INSTALL) -m 644 $(HSFLOWD_CONF) $(CONF_D)/hsflowd.conf
 	$(INSTALL) -d $(SYSTEMD_D)
 	$(INSTALL) -m 644 $(HSFLOWD_SYSTEMD_SERVICE) $(SYSTEMD_D)/hsflowd.service
 	$(INSTALL) -d $(INIT_D)
 	$(INSTALL) -m 755 $(HSFLOWD_INITSCRIPT) $(INIT_D)/hsflowd
 	$(INSTALL) -d $(MOD_D)
 	$(INSTALL) -m 755 *.so $(MOD_D)
+ifneq ($(strip $(HSFLOWD_DBUS_CONF)),)
 	$(INSTALL) -d $(DBUS_D)
 	$(INSTALL) -m 644 $(HSFLOWD_DBUS_CONF) $(DBUS_D)
+endif
 
 #########  schedule  #########
 
@@ -487,10 +596,13 @@ mod_kvm.o: mod_kvm.c $(HEADERS)
 mod_docker.o: mod_docker.c $(HEADERS)
 mod_ulog.o: mod_ulog.c $(HEADERS)
 mod_nflog.o: mod_nflog.c $(HEADERS)
+mod_psample.o: mod_psample.c $(HEADERS)
+mod_dropmon.o: mod_dropmon.c $(HEADERS)
 mod_pcap.o: mod_pcap.c $(HEADERS)
 mod_tcp.o: mod_tcp.c $(HEADERS)
 mod_nvml.o: mod_nvml.c $(HEADERS)
 mod_cumulus.o: mod_cumulus.c $(HEADERS)
+mod_dent.o: mod_dent.c $(HEADERS)
 mod_ovs.o: mod_ovs.c $(HEADERS)
 mod_opx.o: mod_opx.c $(HEADERS)
 mod_dbus.o: mod_dbus.c $(HEADERS)

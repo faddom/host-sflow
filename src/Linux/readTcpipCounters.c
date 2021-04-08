@@ -48,9 +48,10 @@ extern "C" {
     FILE *procFile;
     char line[MAX_PROC_LINE_CHARS];
 
-    procFile= fopen("/proc/net/snmp", "r");
+    procFile= fopen(PROCFS_STR "/net/snmp", "r");
     if(procFile) {
-      while(fgets(line, MAX_PROC_LINE_CHARS, procFile)) {
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	char *p = line;
 	char buf[MAX_PROC_LINE_CHARS];
 	char *var = parseNextTok(&p, " \t", NO, 0, NO, buf, MAX_PROC_LINE_CHARS);

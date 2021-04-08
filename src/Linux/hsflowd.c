@@ -15,9 +15,10 @@ extern "C" {
   int exitStatus = EXIT_SUCCESS;
   FILE *f_crash = NULL;
 
+  static void openCollectorSockets(HSP *sp, HSPSFlowSettings *settings);
   static bool installSFlowSettings(HSP *sp, HSPSFlowSettings *settings);
   static bool updatePollingInterval(HSP *sp);
-
+  
   /*_________________---------------------------__________________
     _________________     agent callbacks       __________________
     -----------------___________________________------------------
@@ -47,6 +48,9 @@ extern "C" {
     // grab sp->sync whenever we call sfl_sampler_writeFlowSample(),  because that can
     // bring us here where we read the list of collectors.
 
+    if(sp->suppress_sendPkt)
+      return;
+
     if(sp->sFlowSettings == NULL)
       return;
 
@@ -62,6 +66,12 @@ extern "C" {
 			    coll->socklen);
 	if(result == -1 && errno != EINTR) {
 	  EVLog(60, LOG_ERR, "socket sendto error: %s", strerror(errno));
+	  // We have the agent semaphore lock here, so it's safe
+	  // to close and clear the socket, then set a countdown
+	  // to try opening it again.
+	  close(coll->socket);
+	  coll->socket = 0;
+	  sp->reopenCollectorSocketCountdown = HSP_RETRY_COLLECTOR_SOCKET;
 	}
 	else if(result == 0) {
 	  EVLog(60, LOG_ERR, "socket sendto returned 0: %s", strerror(errno));
@@ -88,11 +98,12 @@ extern "C" {
     return adaptor;
   }
 
-  void adaptorAddOrReplace(UTHash *ht, SFLAdaptor *ad) {
+  void adaptorAddOrReplace(UTHash *ht, SFLAdaptor *ad, char *htname) {
     SFLAdaptor *replaced = UTHashAdd(ht, ad);
     if(replaced && replaced != ad) {
       char buf1[256], buf2[256];
-      myDebug(1, "adaptorAddOrReplace: replacing adaptor [%s] with [%s]",
+      myDebug(1, "adaptorAddOrReplace: %s: replacing adaptor [%s] with [%s]",
+	      htname,
 	      adaptorStr(replaced, buf1, 256),
 	      adaptorStr(ad, buf2, 256));
       // This can happen quite commonly when two interfaces share the
@@ -103,7 +114,7 @@ extern "C" {
   }
 
   SFLAdaptor *adaptorByName(HSP *sp, char *dev) {
-    SFLAdaptor ad = { .deviceName = trimWhitespace(dev) };
+    SFLAdaptor ad = { .deviceName = dev };
     return UTHashGet(sp->adaptorsByName, &ad);
   }
 
@@ -142,6 +153,8 @@ extern "C" {
   }
 
   void deleteAdaptor(HSP *sp, SFLAdaptor *ad, int freeFlag) {
+    if(sp->allowDeleteAdaptor == NO)
+      return;
     deleteAdaptorFromHT(sp->adaptorsByName, ad, "byName");
     deleteAdaptorFromHT(sp->adaptorsByIndex, ad, "byIndex");
     deleteAdaptorFromHT(sp->adaptorsByMac, ad, "byMac");
@@ -232,6 +245,23 @@ extern "C" {
   }
 
   /*_________________---------------------------__________________
+    _________________        local IPs          __________________
+    -----------------___________________________------------------
+  */
+
+  HSPLocalIP *localIPNew(SFLAddress *ipAddr, char *dev) {
+    HSPLocalIP *lip = my_calloc(sizeof(HSPLocalIP));
+    lip->ipAddr = *ipAddr;
+    lip->dev = my_strdup(dev);
+    return lip;
+  }
+
+  void localIPFree(HSPLocalIP *lip) {
+    my_free(lip->dev);
+    my_free(lip);
+  }
+
+  /*_________________---------------------------__________________
     _________________   agentCB_getCounters     __________________
     -----------------___________________________------------------
   */
@@ -292,7 +322,8 @@ extern "C" {
     // host TCP/IP counters
     SFLCounters_sample_element ipElem = { 0 }, icmpElem = { 0 }, tcpElem = { 0 }, udpElem = { 0 };
     if(!sp->cumulus.cumulus
-       && !sp->opx.opx) {
+       && !sp->opx.opx
+       && !sp->dent.dent) {
       ipElem.tag = SFLCOUNTERS_HOST_IP;
       icmpElem.tag = SFLCOUNTERS_HOST_ICMP;
       tcpElem.tag = SFLCOUNTERS_HOST_TCP;
@@ -323,6 +354,8 @@ extern "C" {
 
     // send the cs out to be annotated by other modules such as docker, xen, vrt and NVML
     EVEvent *evt_host_cs = EVGetEvent(sp->pollBus, HSPEVENT_HOST_COUNTER_SAMPLE);
+    // TODO: use HSPPendingSample, and remove the extra later of & indirection here
+    // because it is not necessary.
     EVEventTx(sp->rootModule, evt_host_cs, &cs, sizeof(cs));
 
     SEMLOCK_DO(sp->sync_agent) {
@@ -417,6 +450,7 @@ extern "C" {
 	state->volumes = strArrayNew();
 	state->disks = strArrayNew();
 	state->interfaces = adaptorListNew();
+	state->gpus = UTArrayNew(UTARRAY_DFLT);
 	sp->refreshAdaptorList = YES;
 	SFLDataSource_instance dsi;
 	// ds_class = <virtualEntity>, ds_index = offset + <assigned>, ds_instance = 0
@@ -472,10 +506,52 @@ extern "C" {
     if(sp->sFlowSettings_str) fputs(sp->sFlowSettings_str, sp->f_out);
     // repeat the revision number. The reader knows that if the revison number
     // has not changed under his feet then he has a consistent config.
+
+    // TODO: if settings did not override agentIP, print here
+    // TODO: if settings did not override agent (device), print here
+
     fprintf(sp->f_out, "rev_end=%u\n", sp->revisionNo);
     fflush(sp->f_out);
     // chop off anything that may be lingering from before
     UTTruncateOpenFile(sp->f_out);
+  }
+
+  /*_________________---------------------------__________________
+    _________________       tick                __________________
+    -----------------___________________________------------------
+  */
+
+  static void refreshAdaptorsAndAgentAddress(HSP *sp) {
+    uint32_t ad_added=0, ad_removed=0, ad_cameup=0, ad_wentdown=0, ad_changed=0;
+    if(readInterfaces(sp, YES, &ad_added, &ad_removed, &ad_cameup, &ad_wentdown, &ad_changed) == 0) {
+      myLog(LOG_ERR, "failed to re-read interfaces\n");
+    }
+    else {
+      myDebug(1, "interfaces added: %u removed: %u cameup: %u wentdown: %u changed: %u",
+	      ad_added, ad_removed, ad_cameup, ad_wentdown, ad_changed);
+    }
+
+    int agentAddressChanged=NO;
+    if(selectAgentAddress(sp, &agentAddressChanged) == NO) {
+      myLog(LOG_ERR, "failed to re-select agent address\n");
+      // TODO: what should we do in this case?
+    }
+    myDebug(1, "agentAddressChanged=%s", agentAddressChanged ? "YES" : "NO");
+    if(agentAddressChanged) {
+      SEMLOCK_DO(sp->sync_agent) {
+	sfl_agent_set_address(sp->agent, &sp->agentIP);
+      }
+      // this incs the revision No so it causes the
+      // output file to be rewritten below too.
+      installSFlowSettings(sp, sp->sFlowSettings);
+    }
+
+    if(ad_added || ad_removed || ad_cameup || ad_wentdown || ad_changed) {
+      // test for switch ports
+      configSwitchPorts(sp); // in readPackets.c
+      // announce (e.g. to adjust sampling rates if ifSpeeds changed)
+      EVEventTxAll(sp->rootModule, HSPEVENT_INTFS_CHANGED, NULL, 0);
+    }
   }
 
   /*_________________---------------------------__________________
@@ -508,6 +584,26 @@ extern "C" {
       // sfl_agent_tick(sp->agent, clk);
       for(SFLPoller *pl = sp->agent->pollers; pl; pl = pl->nxt)
 	sfl_poller_tick(pl, clk);
+      for(SFLNotifier *nf = sp->agent->notifiers; nf; nf = nf->nxt)
+	sfl_notifier_tick(nf, clk);
+
+      // If a collector socket failed, we will attempt to reopen it
+      // here after a suitable cooling off period. One scenario for
+      // this is if the interface VRF is changed under our feet. That
+      // results in the sentto() failing with "No Such Device".
+      // Reopening here while we have the agent semaphore means that
+      // another thread will not try to send something while the
+      // socket is half opened. For consistency we could choose to
+      // hold the same semaphore in the more common "installSFlowSettings"
+      // path, but there the collector sockets are deliberately opened
+      // before the settings "go live" so it is not necessary.
+      if(sp->reopenCollectorSocketCountdown) {
+	if(--sp->reopenCollectorSocketCountdown == 0) {
+	  myDebug(1, "Reopening collector socket(s) after error");
+	  openCollectorSockets(sp, sp->sFlowSettings);
+	}
+      }
+
     }
     // We can only get away with this scheme because the poller
     // objects are only ever removed and free by this thread.
@@ -543,36 +639,7 @@ extern "C" {
        || clk >= sp->next_refreshAdaptorList) {
       sp->refreshAdaptorList = NO;
       sp->next_refreshAdaptorList = clk + sp->refreshAdaptorListSecs;
-      uint32_t ad_added=0, ad_removed=0, ad_cameup=0, ad_wentdown=0, ad_changed=0;
-      if(readInterfaces(sp, YES, &ad_added, &ad_removed, &ad_cameup, &ad_wentdown, &ad_changed) == 0) {
-	myLog(LOG_ERR, "failed to re-read interfaces\n");
-      }
-      else {
-	myDebug(1, "interfaces added: %u removed: %u cameup: %u wentdown: %u changed: %u",
-		ad_added, ad_removed, ad_cameup, ad_wentdown, ad_changed);
-      }
-
-      int agentAddressChanged=NO;
-      if(selectAgentAddress(sp, &agentAddressChanged) == NO) {
-	  myLog(LOG_ERR, "failed to re-select agent address\n");
-	  // TODO: what should we do in this case?
-      }
-      myDebug(1, "agentAddressChanged=%s", agentAddressChanged ? "YES" : "NO");
-      if(agentAddressChanged) {
-	SEMLOCK_DO(sp->sync_agent) {
-	  sfl_agent_set_address(sp->agent, &sp->agentIP);
-	}
-	// this incs the revision No so it causes the
-	// output file to be rewritten below too.
-	installSFlowSettings(sp, sp->sFlowSettings);
-      }
-
-      if(ad_added || ad_cameup || ad_wentdown || ad_changed) {
-	// test for switch ports
-	configSwitchPorts(sp); // in readPackets.c
-	// announce (e.g. to adjust sampling rates if ifSpeeds changed)
-	EVEventTxAll(sp->rootModule, HSPEVENT_INTFS_CHANGED, NULL, 0);
-      }
+      refreshAdaptorsAndAgentAddress(sp);
     }
 
     // rewrite the output if the config has changed
@@ -700,7 +767,6 @@ extern "C" {
     sp->outputFile = HSP_DEFAULT_OUTPUTFILE;
     sp->pidFile = HSP_DEFAULT_PIDFILE;
     sp->crashFile = NULL;
-    sp->daemonize = YES;
     sp->dropPriv = YES;
     sp->refreshAdaptorListSecs = HSP_REFRESH_ADAPTORS;
     sp->checkAdaptorListSecs = HSP_CHECK_ADAPTORS;
@@ -716,14 +782,15 @@ extern "C" {
 
   static void instructions(char *command)
   {
-    fprintf(stderr,"Usage: %s [-dvP] [-p PIDFile] [-u UUID] [-m machine_id] [-f CONFIGFile]\n", command);
+    fprintf(stderr,"Usage: %s [-dvP] [-p PIDFile] [-u UUID] [-m machine_id] [-f CONFIGFile] [-l MODULESDir]\n", command);
     fprintf(stderr,"\n\
              -d:  do not daemonize, and log to stdout/stderr (repeat for more debug details)\n\
              -v:  print version number and exit\n\
              -P:  do not drop privileges (run as root)\n\
      -p PIDFile:  specify PID file (default is " HSP_DEFAULT_PIDFILE ")\n\
         -u UUID:  specify UUID as unique ID for this host\n\
-  -f CONFIGFile:  specify config file (default is " HSP_DEFAULT_CONFIGFILE ")\n\n\
+  -f CONFIGFile:  specify config file (default is " HSP_DEFAULT_CONFIGFILE ")\n\
+  -l MODULESDir:  specify modules directory (default is " STRINGIFY_DEF(HSP_MOD_DIR) ")\n \
    -c CRASHFile:  specify file to write crash info to (default is stderr)\n");
   fprintf(stderr, "=============== More Information ============================================\n");
   fprintf(stderr, "| sFlow standard        - http://www.sflow.org                              |\n");
@@ -741,7 +808,7 @@ extern "C" {
   static void processCommandLine(HSP *sp, int argc, char *argv[])
   {
     int in;
-    while ((in = getopt(argc, argv, "dDvPp:f:o:u:m:?hc:")) != -1) {
+    while ((in = getopt(argc, argv, "dDvPp:f:l:o:u:m:?hc:")) != -1) {
       switch(in) {
       case 'v':
 	printf("%s version %s\n", argv[0], STRINGIFY_DEF(HSP_VERSION));
@@ -749,13 +816,14 @@ extern "C" {
 	break;
       case 'd':
 	// first 'd' just turns off daemonize, second increments debug
-	if(!sp->daemonize)
+	if(!getDaemon())
 	  setDebug(getDebug() + 1);
-	sp->daemonize=NO;
+	setDaemon(NO);
 	break;
       case 'P': sp->dropPriv = NO; break;
       case 'p': sp->pidFile = optarg; break;
       case 'f': sp->configFile = optarg; break;
+      case 'l': sp->modulesPath = my_strlen(optarg) ? optarg : NULL; break;
       case 'o': sp->outputFile = optarg; break;
       case 'c': sp->crashFile = optarg; break;
       case 'u':
@@ -935,7 +1003,7 @@ extern "C" {
       // switch namespace now
       // (1) open /var/run/netns/<namespace>
       char topath[HSP_MAX_NETNS_PATH];
-      snprintf(topath, HSP_MAX_NETNS_PATH, "/var/run/netns/%s", coll->namespace);
+      snprintf(topath, HSP_MAX_NETNS_PATH, VARFS_STR "/run/netns/%s", coll->namespace);
       int nsfd = open(topath, O_RDONLY | O_CLOEXEC);
       if(nsfd < 0) {
 	myLog(LOG_ERR, "cannot open %s : %s", topath, strerror(errno));
@@ -1042,6 +1110,7 @@ extern "C" {
 	  }
 	  else {
 	    pthread_join(*thread, NULL);
+	    my_free(thread);
 	  }
 	}
 	else {
@@ -1123,9 +1192,12 @@ extern "C" {
     // EVEventTxAll(sp->rootModule, HSPEVENT_CONFIG_DONE, NULL, 0);
 
     // cleanup
-    if(prev_settings_str)
+    if(prev_settings_str
+       && prev_settings_str != sp->sFlowSettings_str)
       my_free(prev_settings_str);
-    if(prev_settings) {
+    if(prev_settings
+       && prev_settings != sp->sFlowSettings_file
+       && prev_settings != sp->sFlowSettings) {
       closeCollectorSockets(sp, prev_settings);
       freeSFlowSettings(prev_settings);
     }
@@ -1195,11 +1267,20 @@ extern "C" {
     }
     else {
       // C: make this new one the running config.
-      if(!installSFlowSettings(sp, sp->sFlowSettings_dyn)) {
-	// not accepted (probably no change from last time)
-	freeSFlowSettings(sp->sFlowSettings_dyn);
+      if(installSFlowSettings(sp, sp->sFlowSettings_dyn)) {
+	// accepted: clear pointer so we don't free these settings immediately below
 	sp->sFlowSettings_dyn = NULL;
+	// make sure any agentIP related changes take effect immediately
+	refreshAdaptorsAndAgentAddress(sp);
+	// and open the tap if it was closed
+	sp->suppress_sendPkt = NO;
       }
+    }
+    // if we didn't use the new settings for any reason then make
+    // sure we recover the space and avoid dangling the pointer.
+    if(sp->sFlowSettings_dyn) {
+      freeSFlowSettings(sp->sFlowSettings_dyn);
+      sp->sFlowSettings_dyn = NULL;
     }
   }
 
@@ -1209,24 +1290,36 @@ extern "C" {
   */
 
   static bool updatePollingInterval(HSP *sp) {
-    if(sp->sFlowSettings == NULL)
+    if(sp->sFlowSettings == NULL) {
+      // don't set actualPollingInterval until we have a config
+      // -- e.g. in case it is set to 0 rather than the default.
       return NO;
+    }
 
     // pick up the configured polling interval
-    uint32_t pollingInterval = sp->sFlowSettings ?
-      sp->sFlowSettings->pollingInterval :
-      SFL_DEFAULT_POLLING_INTERVAL;
+    uint32_t pollingInterval = sp->sFlowSettings->pollingInterval;
 
     // apply constraints
-    if(pollingInterval < sp->minPollingInterval) {
+    if(pollingInterval > 0
+       && pollingInterval < sp->minPollingInterval) {
       pollingInterval = sp->minPollingInterval;
       myDebug(1, "override polling interval to min: %u", pollingInterval);
     }
 
-    bool changed = (pollingInterval != sp->actualPollingInterval);
-    // store for all to use and return the changed flag
-    sp->actualPollingInterval = pollingInterval;
-    return changed;
+    if(pollingInterval != sp->actualPollingInterval) {
+      // store for all to use
+      sp->actualPollingInterval = pollingInterval;
+      // make sure any existing pollers get the memo
+      if(sp->agent) {
+	SEMLOCK_DO(sp->sync_agent) {
+	  for(SFLPoller *pl = sp->agent->pollers; pl; pl = pl->nxt) {
+	    sfl_poller_set_sFlowCpInterval(pl, sp->actualPollingInterval);
+	  }
+	}
+      }
+      return YES;
+    }
+    return NO;
   }
 
   /*_________________---------------------------__________________
@@ -1241,9 +1334,12 @@ extern "C" {
 
     if(sp->sFlowSettings == NULL
        || sp->sFlowSettings->collectors == NULL) {
-      myLog(LOG_ERR, "evt_config_first: no collectors defined");
-      if(!sp->DNSSD.DNSSD)
+      if(sp->DNSSD.DNSSD == NO
+	 && sp->eapi.eapi == NO
+	 && sp->sonic.sonic == NO) {
+	myLog(LOG_ERR, "evt_config_first: no collectors defined");
 	abort();
+      }
     }
   }
 
@@ -1457,13 +1553,7 @@ extern "C" {
     }
 
     // did the polling interval change?
-    if(updatePollingInterval(sp)) {
-      SEMLOCK_DO(sp->sync_agent) {
-	for(SFLPoller *pl = sp->agent->pollers; pl; pl = pl->nxt) {
-	  sfl_poller_set_sFlowCpInterval(pl, sp->actualPollingInterval);
-	}
-      }
-    }
+    updatePollingInterval(sp);
 
     // now that interfaces have been fully discovered (in evt_config_first)
     // and sflow agent is initialized, check to see if we should be exporting
@@ -1600,7 +1690,7 @@ extern "C" {
       exit(EXIT_FAILURE);
     }
 
-    if(sp->daemonize) {
+    if(getDaemon()) {
       // fork to daemonize
       pid_t pid = fork();
       if(pid < 0) {
@@ -1699,6 +1789,8 @@ extern "C" {
     sp->adaptorsByIndex = UTHASH_NEW(SFLAdaptor, ifIndex, UTHASH_SYNC);
     sp->adaptorsByPeerIndex = UTHASH_NEW(SFLAdaptor, peer_ifIndex, UTHASH_SYNC);
     sp->adaptorsByMac = UTHASH_NEW(SFLAdaptor, macs[0], UTHASH_SYNC);
+    // sometimes need to suppress the deleting of adaptors for test purposes.
+    sp->allowDeleteAdaptor = YES;
 
     // these ones do not need sync - always accessed from same thread
     sp->vmsByUUID = UTHASH_NEW(HSPVMState, uuid, UTHASH_DFLT);
@@ -1723,27 +1815,51 @@ extern "C" {
     // explicitly in the config file - but do this before we read
     // the config so that overrides are possible.
 #ifdef HSP_LOAD_CUMULUS
-    myLog(LOG_INFO, "autoload CUMULUS, ULOG/NFLOG and SYSTEMD modules");
+    myLog(LOG_INFO, "autoload CUMULUS, NFLOG, PSAMPLE, SYSTEMD and DROPMON modules");
     sp->cumulus.cumulus = YES;
     sp->systemd.systemd = YES;
-    uint32_t dsopts_cumulus = HSP_SAMPLEOPT_IF_SAMPLER
-      | HSP_SAMPLEOPT_IF_POLLER
-      | HSP_SAMPLEOPT_ASIC
-      | HSP_SAMPLEOPT_DIRN_HOOK
-      | HSP_SAMPLEOPT_CUMULUS;
-    // Cumulus Linux 2.5 or earlier uses ULOG group 1
-    // So it should be compiled with:
-    // make deb FEATURES="CUMULUS ULOG"
-    sp->ulog.ulog = YES;
-    sp->ulog.group = 1;
-    sp->ulog.ds_options = dsopts_cumulus | HSP_SAMPLEOPT_ULOG;
-    // Cumulus Linux 3.0 or later uses NFLOG group 1
-    // So it should be compiled with:
-    // make deb FEATURES="CUMULUS NFLOG"
+    // force the hardwareSampling flag on, to ensure that sampling-rate is handled correctly.
+    // We used to only set this if and when mod_cumulus was able to call out to the script
+    // to set the samplingRate, but that resulted in a race where software sampling was
+    // configured and not subsequently retracted.  Now that sampling on Cumulus is configured
+    // via tc(1) and handled via mod_psample the distinction is no longer needed anyway.
+    sp->hardwareSampling = YES;
+    // Cumulus Linux 2.5 or earlier used ULOG group 1
+    // Cumulus Linux 3.0 or later used NFLOG group 1
     sp->nflog.nflog = YES;
     sp->nflog.group = 1;
-    sp->nflog.ds_options = dsopts_cumulus | HSP_SAMPLEOPT_NFLOG;
+    sp->nflog.ds_options = HSP_SAMPLEOPT_IF_SAMPLER
+      | HSP_SAMPLEOPT_IF_POLLER
+      | HSP_SAMPLEOPT_BRIDGE
+      | HSP_SAMPLEOPT_DIRN_HOOK
+      | HSP_SAMPLEOPT_NFLOG;
+    // Cumulus Linux 4.0 or later uses PSAMPLE group 1
+    // Note that the DIRN_HOOK is no longer available
+    // and we assume ingress-only sampling
+    sp->psample.psample = YES;
+    sp->psample.ingress = YES;
+    sp->psample.egress = NO;
+    sp->psample.group = 1;
+    // assume netlink drop-monitor is configured externally
+    sp->dropmon.dropmon = YES;
+    sp->dropmon.group = 1;
+    sp->dropmon.start = NO;
+    sp->dropmon.limit = 1000;
+    sp->dropmon.sw = NO;
+    sp->dropmon.hw = YES;
 #endif /* HSP_LOAD_CUMULUS */
+
+#ifdef HSP_LOAD_DENT
+    myLog(LOG_INFO, "autoload DENT, PSAMPLE modules");
+    sp->dent.dent = YES;
+    // force the hardwareSampling flag on, to ensure that sampling-rate is handled correctly.
+    sp->hardwareSampling = YES;
+    // default to PSAMPLE group 1, ingress only
+    sp->psample.psample = YES;
+    sp->psample.ingress = YES;
+    sp->psample.egress = NO;
+    sp->psample.group = 1;
+#endif /* HSP_LOAD_DENT */
 
 #ifdef HSP_LOAD_OPX
     // OPX should be compiled with "make deb FEATURES="OPX DBUS"
@@ -1751,6 +1867,17 @@ extern "C" {
     sp->opx.opx = YES;
     sp->dbus.dbus = YES;
 #endif /* HSP_LOAD_OPX */
+
+#ifdef HSP_LOAD_SONIC
+    // SONIC should be compiled with "make deb FEATURES="SONIC"
+    myLog(LOG_INFO, "autoload SONIC and PSAMPLE modules");
+    sp->sonic.sonic = YES;
+    sp->sonic.unixsock = YES;
+    sp->psample.psample = YES;
+    sp->psample.ingress = YES;
+    sp->psample.egress = NO;
+    sp->psample.group = 1;
+#endif /* HSP_LOAD_SONIC */
 
 #ifdef HSP_LOAD_XEN
     myLog(LOG_INFO, "autoload XEN and OVS modules");
@@ -1771,6 +1898,11 @@ extern "C" {
 
     if(sp->eapi.eapi && sp->DNSSD.DNSSD) {
       myLog(LOG_ERR, "cannot run eapi and dns-sd modules together");
+      exit(EXIT_FAILURE);
+    }
+
+    if(sp->sonic.sonic && sp->DNSSD.DNSSD) {
+      myLog(LOG_ERR, "cannot run sonic and dns-sd modules together");
       exit(EXIT_FAILURE);
     }
 
@@ -1864,14 +1996,22 @@ extern "C" {
       EVLoadModule(sp->rootModule, "mod_ulog", sp->modulesPath);
     if(sp->nflog.nflog)
       EVLoadModule(sp->rootModule, "mod_nflog", sp->modulesPath);
+    if(sp->psample.psample)
+      EVLoadModule(sp->rootModule, "mod_psample", sp->modulesPath);
+    if(sp->dropmon.dropmon)
+      EVLoadModule(sp->rootModule, "mod_dropmon", sp->modulesPath);
     if(sp->nvml.nvml)
       EVLoadModule(sp->rootModule, "mod_nvml", sp->modulesPath);
     if(sp->ovs.ovs)
       EVLoadModule(sp->rootModule, "mod_ovs", sp->modulesPath);
     if(sp->cumulus.cumulus)
       EVLoadModule(sp->rootModule, "mod_cumulus", sp->modulesPath);
+    if(sp->dent.dent)
+      EVLoadModule(sp->rootModule, "mod_dent", sp->modulesPath);
     if(sp->opx.opx)
       EVLoadModule(sp->rootModule, "mod_opx", sp->modulesPath);
+    if(sp->sonic.sonic)
+      EVLoadModule(sp->rootModule, "mod_sonic", sp->modulesPath);
     if(sp->dbus.dbus)
       EVLoadModule(sp->rootModule, "mod_dbus", sp->modulesPath);
     if(sp->systemd.systemd)
@@ -1898,9 +2038,18 @@ extern "C" {
       // That calls evt_config_changed() below, which updates polling and
       // sampling settings.
     }
+
+    if(sp->DNSSD.DNSSD
+       || sp->sonic.sonic) {
+      // mod_dnssd and mod_sonic should start with a blank config.
+      // Sending should be suppressed until the config (especially agentIP)
+      // are fully established.
+      // TODO: should this apply to EAPI too?
+      sp->suppress_sendPkt = YES;
+    }
     else {
-      // just push in the config from the file. This will trigger a
-      // HSPEVENT_CONFIG_CHANGED right away.
+      // For all other cases we just push in the config from the file.
+      // This will trigger a HSPEVENT_CONFIG_CHANGED right away.
       installSFlowSettings(sp, sp->sFlowSettings_file);
     }
 

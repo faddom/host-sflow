@@ -38,11 +38,11 @@ extern "C" {
 
   void updateBondCounters(HSP *sp, SFLAdaptor *bond) {
     char procFileName[256];
-    snprintf(procFileName, 256, "/proc/net/bonding/%s", bond->deviceName);
+    snprintf(procFileName, 256, PROCFS_STR "/net/bonding/%s", bond->deviceName);
     FILE *procFile = fopen(procFileName, "r");
     if(procFile) {
       // limit the number of chars we will read from each line
-      // (there can be more than this - fgets will chop for us)
+      // (there can be more than this - my_readline will chop for us)
 #define MAX_PROC_LINE_CHARS 240
       char line[MAX_PROC_LINE_CHARS];
       SFLAdaptor *currentSlave = NULL;
@@ -57,13 +57,14 @@ extern "C" {
       memset(bond_nio->lacp.partnerSystemID, 0, 6);
       int readingMaster = YES; // bond master data comes first
       int gotActorID = NO;
-      while(fgets(line, MAX_PROC_LINE_CHARS, procFile)) {
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	char buf_var[MAX_PROC_LINE_CHARS];
 	char buf_val[MAX_PROC_LINE_CHARS];
 	// buf_var is up to first ':', buf_val is the rest
 	if(sscanf(line, "%[^:]:%[^\n]", buf_var, buf_val) == 2) {
-	  char *tok_var = trimWhitespace(buf_var);
-	  char *tok_val = trimWhitespace(buf_val);
+	  char *tok_var = trimWhitespace(buf_var, my_strnlen(buf_var, MAX_PROC_LINE_CHARS-1));
+	  char *tok_val = trimWhitespace(buf_val, my_strnlen(buf_var, MAX_PROC_LINE_CHARS-1));
 
 	  if(readingMaster) {
 	    if(my_strequal(tok_var, "MII Status")) {
@@ -115,7 +116,7 @@ extern "C" {
 	  // detect transitions to slave data:
 	  if(my_strequal(tok_var, "Slave Interface")) {
 	    readingMaster = NO;
-	    currentSlave = adaptorByName(sp, trimWhitespace(tok_val));
+	    currentSlave = adaptorByName(sp, tok_val);
 	    slave_nio = currentSlave ? ADAPTOR_NIO(currentSlave) : NULL;
 	    myDebug(1, "updateBondCounters: bond %s slave %s %s",
 		  bond->deviceName,
@@ -348,7 +349,8 @@ extern "C" {
     UTHASH_WALK(sp->adaptorsByIndex, adaptor) {
       HSPAdaptorNIO *nio = ADAPTOR_NIO(adaptor);
       if(nio->poller
-	 && nio->switchPort) {
+	 && nio->switchPort
+	 && nio->poller->sFlowCpInterval) {
 	uint32_t countdown = nio->poller->countersCountdown;
 	uint32_t nudgeBack = countdown % sp->syncPollingInterval;
 	uint32_t nudgeFwd = sp->syncPollingInterval - nudgeBack;
@@ -872,7 +874,7 @@ extern "C" {
     }
 
     FILE *procFile;
-    procFile= fopen("/proc/net/dev", "r");
+    procFile= fopen(PROCFS_STR "/net/dev", "r");
     if(procFile) {
       int fd = socket (PF_INET, SOCK_DGRAM, 0);
       struct ifreq ifr;
@@ -890,10 +892,11 @@ extern "C" {
       uint64_t errs_out = 0;
       uint64_t drops_out = 0;
       // limit the number of chars we will read from each line
-      // (there can be more than this - fgets will chop for us)
+      // (there can be more than this - my_readline will chop for us)
 #define MAX_PROC_LINE_CHARS 240
       char line[MAX_PROC_LINE_CHARS];
-      while(fgets(line, MAX_PROC_LINE_CHARS, procFile)) {
+      int truncated;
+      while(my_readline(procFile, line, MAX_PROC_LINE_CHARS, &truncated) != EOF) {
 	char deviceName[MAX_PROC_LINE_CHARS];
 	// assume the format is:
 	// Inter-|   Receive                                                |  Transmit
@@ -908,7 +911,11 @@ extern "C" {
 		  &pkts_out,
 		  &errs_out,
 		  &drops_out) == 9) {
-	  SFLAdaptor *adaptor = adaptorByName(sp, deviceName);
+	  uint32_t devLen = my_strnlen(deviceName, MAX_PROC_LINE_CHARS-1);
+	  char *trimmed = trimWhitespace(deviceName, devLen);
+	  if(trimmed == NULL)
+	    continue;
+	  SFLAdaptor *adaptor = adaptorByName(sp, trimmed);
 	  if(adaptor) {
 
 	    if(filter && (filter != adaptor))
